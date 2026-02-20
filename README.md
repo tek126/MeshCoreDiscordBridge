@@ -6,52 +6,74 @@ This fork significantly extends the original project with **multi-channel routin
 
 ---
 
-## MeshCore Setup
+## Prerequisites
 
-1. Flash your MeshCore node with the **latest client firmware** over USB.
-2. Connect the node to the system running this bridge.
-3. Update `config.json` and set the correct serial port for your node:
-   - Linux: `/dev/ttyUSB0`, `/dev/ttyACM0`
-   - macOS: `/dev/tty.usbserial-XXXX`
-   - Windows: `COM3`, `COM4`, etc.
+* **Node.js:** v18.0.0 or higher (Required for top-level await).
+* **Hardware:** A MeshCore node flashed with the latest client firmware.
+* **Process Manager:** PM2 is recommended for 24/7 background operation.
 
 ---
 
-## Discord Setup
+## Installation & Setup
 
-1. Open the **Discord Developer Portal** and create a new application.
+### 1. Hardware & System
+1. Flash your MeshCore node and connect it via USB.
+2. Identify your serial port:
+   - Linux: /dev/ttyUSB0 or /dev/ttyACM0
+   - macOS: /dev/tty.usbserial-XXXX
+   - Windows: COM3, COM4, etc.
+3. Install dependencies:
+   `npm install`
+
+### 2. Discord Developer Portal Setup
+1. Open the Discord Developer Portal and create a new application.
 2. In the **Bot** tab, enable:
    - Presence Intent  
    - Server Members Intent  
    - Message Content Intent
-3. Copy your **Bot Token** into `config.json`.
-4. Enable **Developer Mode** in Discord.
-5. Copy the IDs of the Discord channels you want to bridge.
-6. Add the bot to one or more servers (guilds).
-7. Configure routing and permissions in `config.json`.
+3. Copy your **Bot Token** into config.json.
+4. Go to **OAuth2 -> URL Generator**, select 'bot' and 'applications.commands', then use the generated link to invite the bot to your server.
 
-This fork supports **multiple Discord servers (guilds)** from a single bot instance.
+### 3. Configuration (config.json)
+Create a config.json in the root directory. Note: JSON does not support comments (//), so ensure the file only contains valid JSON data.
+
+{
+  "identifier": "!",
+  "CLIENT_ID": "YOUR_APPLICATION_ID",
+  "DISCORD_TOKEN": "YOUR_BOT_TOKEN",
+  "SERIAL_PORT": "/dev/ttyUSB0",
+  "GUILD_ID": "YOUR_SERVER_ID",
+  "DISCORD_CHANNEL_ID": "YOUR_PRIMARY_CHANNEL_ID"
+}
+
+---
+
+## Running the Bridge (PM2)
+
+To keep the bridge running in the background and auto-restart on boot:
+
+1. **Start the bridge:**
+   `sudo npm install pm2@latest -g`
+   `pm2 start main.js --name mesh-bridge`
+2. **Monitor logs:**
+   `pm2 logs mesh-bridge`
+3. **Setup boot persistence:**
+   `pm2 startup` (and run the command it generates)
+   `pm2 save`
 
 ---
 
 ## Message Flow Overview
 
 ### Mesh → Discord
-
-- Mesh messages are routed to Discord channels based on **mesh channel index**.
+- Mesh messages are routed based on mesh channel index.
 - PocketMesh emoji “reaction” messages are automatically ignored.
-- Profanity triggers a warning back to the originating mesh channel and echoes the warning in Discord.
-- Optional hashtag-based routing (e.g. `#meshmonday`) is preserved.
+- Profanity triggers a warning back to the originating mesh channel.
 - Forwarding can be paused globally via command.
 
 ### Discord → Mesh
-
-- Messages can be sent via:
-  - Slash command (`/send`)
-  - Prefix command (`!send`, `/send`, etc.)
-  - Always-forward mode for a designated Discord channel
-- Discord channels are explicitly mapped to mesh channel indices.
-- Long messages are safely **chunked and paced** to fit MeshCore limits.
+- Messages can be sent via Slash commands (/send) or Prefix commands (!send).
+- Long messages are safely chunked and paced (e.g., 1/2, 2/2).
 - Flood protection prevents accidental mesh overload.
 
 ---
@@ -59,57 +81,23 @@ This fork supports **multiple Discord servers (guilds)** from a single bot insta
 ## Commands
 
 ### Discord → Mesh
-
-- `/send <message>`
-- `!send <message>` (prefix configurable)
-- `/advert` or `!advert` — sends a flood advert from the connected node
-
-Messages are routed to the mesh channel mapped to the Discord channel they originate from.
-
----
+- /send <message> — Send text to the mesh.
+- /advert — Sends a flood advert from the connected node.
 
 ### Bridge Control Commands
-
-These commands require Administrator, Manage Guild, or an allowed role.
-
-- `/bridge status` — show current forwarding state  
-- `/bridge pause` — pause all mesh ↔ Discord forwarding  
-- `/bridge resume` — resume normal operation  
+(Requires Administrator or Manage Guild roles)
+- /bridge status — Show current forwarding state.
+- /bridge pause — Pause all mesh-Discord forwarding.
+- /bridge resume — Resume normal operation.
 
 ---
 
-## Flood Protection
+## Advanced Features
 
-To protect the mesh from excessive traffic:
+### Flood Protection
+- Per-Discord-channel rate limiting is enforced to protect mesh bandwidth.
 
-- Per-Discord-channel rate limiting is enforced.
-- Exceeding the limit triggers a temporary cooldown.
-- An optional warning message is posted in Discord.
-- All thresholds are configurable.
-
----
-
-## Mesh Message Chunking & Reliability
-
-MeshCore imposes message length and throughput limits. This fork adds:
-
-- Automatic **message chunking** for long Discord messages
-- `n/N` counters added **only when chunking is required**
-- Configurable delay between chunks
-- A serialized send queue to prevent interleaving
-- Tunable maximum length for different firmware/client behavior
-
-This greatly improves delivery reliability on lossy or multi-hop mesh networks.
-
----
-
-## Configuration (`config.json`)
-
-### Core Settings
-
-```json
-"identifier"
-"CLIENT_ID"
-"DISCORD_TOKEN"
-"SERIAL_PORT"
-"GUILD_IDS"
+### Mesh Message Chunking & Reliability
+- Automatic message chunking for long Discord messages.
+- n/N counters added only when chunking is required.
+- Serialized send queue to prevent message interleaving.
