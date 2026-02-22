@@ -25,6 +25,17 @@ function isPocketMeshReact(text) {
 const MESH_MAXLEN = Number(config.MESH_MAXLEN ?? 160);
 const MESH_CHUNK_DELAY_MS = Number(config.MESH_CHUNK_DELAY_MS ?? 1500);
 
+function getAlwaysForwardChannelIds() {
+  // New key: DISCORD_ALWAYS_FORWARD_CHANNEL_IDS (array or string)
+  const v = config.DISCORD_ALWAYS_FORWARD_CHANNEL_IDS ?? config.DISCORD_ALWAYS_FORWARD_CHANNEL_ID;
+
+  if (!v) return new Set();
+
+  if (Array.isArray(v)) return new Set(v.map(x => String(x)));
+  return new Set([String(v)]);
+}
+
+
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
@@ -497,19 +508,22 @@ bot.on("interactionCreate", async (interaction) => {
         }
       }
 
-      // echo in the channel (visible to everyone)
-      await interaction.channel.send(`${name}: ${text}`);
+      // Determine route FIRST
+    const meshIdx = getMeshChannelForDiscordChannel(interaction.channelId);
+    if (meshIdx === null) {
+      // Not mapped => don't echo, just tell the user (ephemeral)
+      await interaction.editReply("This channel is not mapped to a mesh channel.");
+      return;
+    }
 
+    // Mapped => optionally echo in-channel, then forward to mesh
+    await interaction.channel.send(`${name}: ${text}`);
       // send to mesh + confirm back to the user
-      const meshIdx = getMeshChannelForDiscordChannel(interaction.channelId);
-      if (meshIdx === null) {
-        await interaction.editReply("This channel is not mapped to a mesh channel.");
-        return;
-      }
-
       await handleSend(text, name, (msg) => interaction.editReply(msg), meshIdx);
       return;
     }
+
+
   } catch (e) {
     console.error("interactionCreate error:", e);
 
@@ -533,7 +547,8 @@ bot.on("messageCreate", async (message) => {
     if (!message.guild) return;
 
     // Always-forward mode for one specific Discord channel
-    if (String(message.channel.id) === String(config.DISCORD_ALWAYS_FORWARD_CHANNEL_ID)) {
+    const alwaysForwardIds = getAlwaysForwardChannelIds();
+    if (alwaysForwardIds.has(String(message.channel.id))) {
       // Bridge pause gate: Discord -> Mesh
       if (isBridgePaused()) {
         if (config.DEBUG) console.debug("[debug] Bridge paused; dropping discord->mesh always-forward message");
