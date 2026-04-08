@@ -49,10 +49,34 @@ function generateMeshHash(text, senderTimestamp) {
   return encodeCrockfordBase32(digest.subarray(0, 5));
 }
 
-// ---- Message history for reaction matching ----
+// ---- Message history for reaction matching (persisted to disk) ----
 // Maps mesh hash -> { discordMessageId, discordChannelId, meshText, senderTimestamp, meshChannelIdx }
-const messageHistory = new Map();
-const MAX_HISTORY = 200;
+const HISTORY_FILE = './message_history.json';
+const MAX_HISTORY = 500;
+
+let messageHistory = new Map();
+
+// Load history from disk on startup
+try {
+  const data = JSON.parse(fs.readFileSync(HISTORY_FILE, 'utf8'));
+  messageHistory = new Map(data);
+  console.log(`Loaded ${messageHistory.size} messages from history.`);
+} catch (e) {
+  // File doesn't exist yet or is invalid — start fresh
+}
+
+let historySaveTimer = null;
+function scheduleSaveHistory() {
+  if (historySaveTimer) return;
+  historySaveTimer = setTimeout(() => {
+    historySaveTimer = null;
+    try {
+      fs.writeFileSync(HISTORY_FILE, JSON.stringify([...messageHistory]));
+    } catch (e) {
+      console.error("Failed to save message history:", e);
+    }
+  }, 5000);
+}
 
 function trackMessage(hash, entry) {
   messageHistory.set(hash, entry);
@@ -61,6 +85,7 @@ function trackMessage(hash, entry) {
     const oldest = messageHistory.keys().next().value;
     messageHistory.delete(oldest);
   }
+  scheduleSaveHistory();
 }
 
 // Reverse lookup: Discord message ID -> hash
@@ -813,16 +838,24 @@ async function onMeshChannelMessageReceived(channelMessage) {
     }
 
     // Track message for reaction matching
-    // MeshCoreOne hashes just the message body (without "SenderName: " prefix)
-    const hash = generateMeshHash(meshBody, channelMessage.senderTimestamp);
-    trackMessage(hash, {
+    // Hash the body without sender name (for reactions from the sender's own device)
+    const entry = {
       discordMessageId: sentMsg.id,
       discordChannelId: routeChannelId,
       meshText: cleaned,
       senderTimestamp: channelMessage.senderTimestamp,
       meshChannelIdx: channelIdx,
-    });
-    if (config.DEBUG) console.debug(`[debug] Tracked message hash=${hash} discordId=${sentMsg.id}`);
+    };
+    const hashBody = generateMeshHash(meshBody, channelMessage.senderTimestamp);
+    trackMessage(hashBody, entry);
+    if (config.DEBUG) console.debug(`[debug] Tracked message hash=${hashBody} discordId=${sentMsg.id}`);
+
+    // Also hash the full cleaned text (for reactions from other clients who see "SenderName: body")
+    if (cleaned !== meshBody) {
+      const hashFull = generateMeshHash(cleaned, channelMessage.senderTimestamp);
+      trackMessage(hashFull, entry);
+      if (config.DEBUG) console.debug(`[debug] Tracked alt hash=${hashFull} discordId=${sentMsg.id}`);
+    }
   } catch (e) {
     console.error(`Failed to route mesh channelIdx=${channelIdx} to ${routeChannelId}:`, e);
   }
@@ -866,6 +899,7 @@ async function handleSend(text, authorName, reply, meshChannelIdx = 0, discordMs
         meshText: sentText,
         senderTimestamp: ts,
         meshChannelIdx: meshChannelIdx,
+        outgoing: true,
       });
       if (config.DEBUG) console.debug(`[debug] Tracked outgoing hash=${hash} discordId=${discordMsgId}`);
     }
@@ -1152,23 +1186,33 @@ bot.on("messageCreate", async (message) => {
       // Optional: don't forward commands typed in that channel (keeps it cleaner)
       if (message.content.startsWith(config.identifier)) return;
 
-      // Upload any image attachments to ImgBB, then shorten the URLs
-      const imageAtts = [...message.attachments.values()].filter(isImageAttachment);
-      const imageLinks = [];
+      // Handle attachments: images go to ImgBB, other files get a name + shortened link
+      const allAtts = [...message.attachments.values()];
+      const imageAtts = allAtts.filter(isImageAttachment);
+      const fileAtts = allAtts.filter(a => !isImageAttachment(a));
+
+      const attachmentLines = [];
+
       for (const att of imageAtts) {
         const link = await uploadToImgBB(att.url);
-        if (link) {
-          const short = await shortenUrl(link);
-          imageLinks.push(short);
-        }
+        if (link) attachmentLines.push(link);
+      }
+
+      for (const att of fileAtts) {
+        const size = att.size;
+        const sizeStr = size < 1024 ? `${size}B`
+          : size < 1048576 ? `${(size / 1024).toFixed(1)}KB`
+          : `${(size / 1048576).toFixed(1)}MB`;
+        const short = await shortenUrl(att.url);
+        attachmentLines.push(`[File: ${att.name}, ${sizeStr}] ${short}`);
       }
 
       const content = (message.content || "").trim();
       const hasText = content.length > 0;
-      const hasImages = imageLinks.length > 0;
+      const hasAttachments = attachmentLines.length > 0;
 
       // Skip if nothing to forward
-      if (!hasText && !hasImages) return;
+      if (!hasText && !hasAttachments) return;
 
       // Build message parts and send, tracking for reaction matching
       const trackOutgoing = (sentText, ts) => {
@@ -1179,6 +1223,7 @@ bot.on("messageCreate", async (message) => {
           meshText: sentText,
           senderTimestamp: ts,
           meshChannelIdx: meshIdx,
+          outgoing: true,
         });
         if (config.DEBUG) console.debug(`[debug] Tracked outgoing hash=${hash} discordId=${message.id}`);
       };
@@ -1186,8 +1231,8 @@ bot.on("messageCreate", async (message) => {
       if (hasText) {
         await sendMeshChunked(meshIdx, `${name} [D]: ${content}`, trackOutgoing);
       }
-      for (const link of imageLinks) {
-        await sendMeshChunked(meshIdx, `${name} [D]: ${link}`, trackOutgoing);
+      for (const line of attachmentLines) {
+        await sendMeshChunked(meshIdx, `${name} [D]: ${line}`, trackOutgoing);
       }
       return;
     }
@@ -1251,11 +1296,17 @@ bot.on("messageReactionAdd", async (reaction, user) => {
     // Look up the original mesh message by Discord message ID
     const lookup = findHashByDiscordMessageId(message.id);
     if (lookup) {
-      // Reacting to a message that came from mesh — use proper PocketMesh format with hash
-      // Extract the target sender name from the original mesh text
-      const meshText = lookup.entry.meshText;
-      const colonIdx = meshText.indexOf(": ");
-      const targetName = colonIdx > 0 ? meshText.slice(0, colonIdx).trim() : "Unknown";
+      // Extract the target sender name
+      // For incoming mesh messages, the target is the mesh sender (before ": ")
+      // For outgoing Discord messages, the target is our bridge's mesh node name
+      let targetName;
+      if (lookup.entry.outgoing) {
+        targetName = config.MESH_NODE_NAME || "Unknown";
+      } else {
+        const meshText = lookup.entry.meshText;
+        const colonIdx = meshText.indexOf(": ");
+        targetName = colonIdx > 0 ? meshText.slice(0, colonIdx).trim() : "Unknown";
+      }
 
       const reactPayload = `${emoji}@[${targetName}]\n${lookup.hash}`;
       if (config.DEBUG) console.debug(`[debug] Sending react to mesh ch=${meshIdx}: ${JSON.stringify(reactPayload)}`);
