@@ -1203,8 +1203,9 @@ bot.on("messageCreate", async (message) => {
         const sizeStr = size < 1024 ? `${size}B`
           : size < 1048576 ? `${(size / 1024).toFixed(1)}KB`
           : `${(size / 1048576).toFixed(1)}MB`;
+        const ext = (att.name?.split('.').pop() || 'file').toUpperCase();
         const short = await shortenUrl(att.url);
-        attachmentLines.push(`[File: ${att.name}, ${sizeStr}] ${short}`);
+        attachmentLines.push(`[${ext}, ${sizeStr}] ${short}`);
       }
 
       const content = (message.content || "").trim();
