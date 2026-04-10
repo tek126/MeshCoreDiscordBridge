@@ -618,6 +618,10 @@ const commands = [
         .setRequired(true)
     ),
 
+  new SlashCommandBuilder()
+    .setName("subscribe-setup")
+    .setDescription("Post the channel subscription message (admin only)"),
+
   // Bridge mode controls
   new SlashCommandBuilder()
     .setName("bridge")
@@ -1055,12 +1059,117 @@ bot.on("interactionCreate", async (interaction) => {
         "`/bridge pause` — Pause message forwarding (admin)",
         "`/bridge resume` — Resume message forwarding (admin)",
         "`/bridge reload` — Reload config without restarting (admin)",
+        "`/subscribe-setup` — Post channel subscription message (admin)",
         "",
         "Messages in forwarding channels are automatically relayed to mesh.",
         "Reactions on bridged messages are mirrored to/from mesh.",
         "Images are uploaded and sent as links.",
       ];
       await interaction.reply({ content: help.join("\n"), flags: MessageFlags.Ephemeral });
+      return;
+    }
+
+    if (interaction.commandName === "subscribe-setup") {
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+      if (!isBridgeAdminMember(interaction.member)) {
+        await interaction.editReply("Not authorized.");
+        return;
+      }
+
+      const subscribableChannels = config.SUBSCRIBABLE_CHANNELS || [];
+      if (subscribableChannels.length === 0) {
+        await interaction.editReply("No subscribable channels configured.");
+        return;
+      }
+
+      const guild = interaction.guild;
+
+      try {
+        // Create roles and set channel permissions for each subscribable channel
+        const roleMap = []; // { name, emoji, role, discordChannelId }
+        for (const ch of subscribableChannels) {
+          const roleName = `Mesh: ${ch.name}`;
+
+          // Find or create role
+          let role = guild.roles.cache.find(r => r.name === roleName);
+          if (!role) {
+            role = await guild.roles.create({
+              name: roleName,
+              reason: "MeshCore channel subscription",
+            });
+          }
+
+          // Set channel permissions — hide from @everyone, show for role
+          const discordChannel = await bot.channels.fetch(ch.discordChannelId).catch(() => null);
+          if (discordChannel) {
+            await discordChannel.permissionOverwrites.edit(guild.id, {
+              ViewChannel: false,
+            }).catch(e => console.error(`Failed to set @everyone perms for ${ch.name}:`, e));
+
+            await discordChannel.permissionOverwrites.edit(role.id, {
+              ViewChannel: true,
+            }).catch(e => console.error(`Failed to set role perms for ${ch.name}:`, e));
+
+            // Make sure the bot can still see and post in the channel
+            await discordChannel.permissionOverwrites.edit(bot.user.id, {
+              ViewChannel: true,
+              SendMessages: true,
+              ManageWebhooks: true,
+            }).catch(e => console.error(`Failed to set bot perms for ${ch.name}:`, e));
+          }
+
+          roleMap.push({ name: ch.name, emoji: ch.emoji, role, discordChannelId: ch.discordChannelId });
+        }
+
+        // Build and post the subscription message
+        const lines = [
+          "**Mesh Channel Subscriptions**",
+          "",
+          "React to join/leave channels:",
+          "",
+        ];
+        for (const entry of roleMap) {
+          lines.push(`${entry.emoji}  \`${entry.name}\``);
+        }
+        lines.push("", "_Remove your reaction to unsubscribe._");
+
+        const subscribeChannelId = config.SUBSCRIBE_CHANNEL_ID;
+        if (!subscribeChannelId) {
+          await interaction.editReply("SUBSCRIBE_CHANNEL_ID not configured.");
+          return;
+        }
+
+        const subChannel = await bot.channels.fetch(subscribeChannelId);
+        const subMsg = await subChannel.send(lines.join("\n"));
+
+        // Add reactions in order
+        for (const entry of roleMap) {
+          await subMsg.react(entry.emoji);
+        }
+
+        // Save the message ID to config for persistence
+        config.SUBSCRIBE_MESSAGE_ID = subMsg.id;
+
+        // Save role mapping to config
+        config._SUBSCRIBE_ROLE_MAP = roleMap.map(e => ({
+          emoji: e.emoji,
+          roleId: e.role.id,
+          name: e.name,
+        }));
+
+        // Persist to config file
+        try {
+          fs.writeFileSync('./config.json', JSON.stringify(config, null, 2));
+        } catch (e) {
+          console.error("Failed to save config:", e);
+        }
+
+        await interaction.editReply(`Subscription message posted! (${roleMap.length} channels configured)`);
+      } catch (e) {
+        console.error("Subscribe setup error:", e);
+        await interaction.editReply(`Setup failed: ${e.message}`);
+      }
       return;
     }
 
@@ -1409,6 +1518,12 @@ bot.on("messageCreate", async (message) => {
 });
 
 // ---- Reaction mirroring: Discord -> Mesh ----
+// ---- Subscription role helper ----
+function findSubscribeRoleForEmoji(emojiName) {
+  const roleMap = config._SUBSCRIBE_ROLE_MAP || [];
+  return roleMap.find(e => e.emoji === emojiName);
+}
+
 bot.on("messageReactionAdd", async (reaction, user) => {
   try {
     // Ignore bot reactions
@@ -1424,6 +1539,21 @@ bot.on("messageReactionAdd", async (reaction, user) => {
 
     const message = reaction.message;
     if (!message.guild) return;
+
+    // Subscription role handling
+    if (config.SUBSCRIBE_MESSAGE_ID && message.id === config.SUBSCRIBE_MESSAGE_ID) {
+      const entry = findSubscribeRoleForEmoji(reaction.emoji.name);
+      if (entry) {
+        try {
+          const member = await message.guild.members.fetch(user.id);
+          await member.roles.add(entry.roleId);
+          if (config.DEBUG) console.debug(`[debug] Subscribed ${user.username} to ${entry.name}`);
+        } catch (e) {
+          console.error(`Failed to add subscribe role:`, e);
+        }
+      }
+      return;
+    }
 
     // Only mirror reactions in channels mapped to mesh
     const meshIdx = getMeshChannelForDiscordChannel(message.channel.id);
@@ -1462,6 +1592,35 @@ bot.on("messageReactionAdd", async (reaction, user) => {
     }
   } catch (e) {
     console.error("Error handling reaction:", e);
+  }
+});
+
+// ---- Subscription role removal on reaction remove ----
+bot.on("messageReactionRemove", async (reaction, user) => {
+  try {
+    if (user.bot) return;
+
+    if (reaction.partial) {
+      try { await reaction.fetch(); } catch { return; }
+    }
+    if (reaction.message.partial) {
+      try { await reaction.message.fetch(); } catch { return; }
+    }
+
+    if (!config.SUBSCRIBE_MESSAGE_ID || reaction.message.id !== config.SUBSCRIBE_MESSAGE_ID) return;
+
+    const entry = findSubscribeRoleForEmoji(reaction.emoji.name);
+    if (entry) {
+      try {
+        const member = await reaction.message.guild.members.fetch(user.id);
+        await member.roles.remove(entry.roleId);
+        if (config.DEBUG) console.debug(`[debug] Unsubscribed ${user.username} from ${entry.name}`);
+      } catch (e) {
+        console.error(`Failed to remove subscribe role:`, e);
+      }
+    }
+  } catch (e) {
+    console.error("Error handling reaction remove:", e);
   }
 });
 

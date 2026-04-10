@@ -1,6 +1,6 @@
 # MeshCore Discord Bridge
 
-A bidirectional bridge between **MeshCore** mesh networks and **Discord**, with webhook-based message display, image uploads, emoji reaction mirroring, and operator controls.
+A bidirectional bridge between **MeshCore** mesh networks and **Discord**, with webhook-based message display, image uploads, emoji reaction mirroring, channel subscriptions, emergency alerts, and operator controls.
 
 This fork significantly extends the original project with multi-channel routing, multi-server support, flood protection, message chunking, reaction mirroring (compatible with MeshCoreOne), webhook-based posting with per-user avatars, image uploads, and much more.
 
@@ -14,17 +14,22 @@ This fork significantly extends the original project with multi-channel routing,
 
 ---
 
-## Installation & Setup
-
-### 1. Clone & Install
+## Quick Start
 
 ```bash
 git clone https://github.com/tek126/MeshCoreDiscordBridge.git
 cd MeshCoreDiscordBridge
 npm install
+node setup.js
 ```
 
-### 2. Hardware
+The **setup wizard** will walk you through configuration step by step, including where to find each value in Discord.
+
+---
+
+## Installation & Setup
+
+### 1. Hardware
 
 1. Flash your MeshCore node and connect it via USB.
 2. Identify your serial port:
@@ -32,7 +37,7 @@ npm install
    - macOS: `/dev/tty.usbserial-XXXX`
    - Windows: `COM3`, `COM4`, etc.
 
-### 3. Discord Developer Portal
+### 2. Discord Developer Portal
 
 1. Open the [Discord Developer Portal](https://discord.com/developers/applications) and create a new application.
 2. In the **Bot** tab, enable:
@@ -41,80 +46,28 @@ npm install
    - Message Content Intent
 3. Copy your **Bot Token**.
 4. Go to **OAuth2 > URL Generator**, select `bot` and `applications.commands`, then use the generated link to invite the bot to your server.
-5. Grant the bot these permissions in each bridged channel:
+5. Grant the bot these server-level permissions:
    - **Send Messages**
-   - **Manage Webhooks** (required for webhook-based message display)
-   - **Add Reactions** (required for reaction mirroring from mesh)
+   - **Manage Webhooks** (for webhook-based message display)
+   - **Add Reactions** (for reaction mirroring from mesh)
+   - **Manage Roles** (for channel subscriptions)
+   - **Manage Channels** (for channel subscription visibility)
 
-### 4. ImgBB API Key (for image uploads)
+### 3. ImgBB API Key (optional, for image uploads)
 
 1. Create a free account at [imgbb.com](https://imgbb.com)
 2. Go to [api.imgbb.com](https://api.imgbb.com) and click "Get API Key"
 3. Copy the key into your config
 
-### 5. Configuration
+### 4. Configuration
 
-Create a `config.json` in the root directory (this file is gitignored):
+Run the setup wizard for guided configuration:
 
-```json
-{
-  "identifier": "!",
-  "CLIENT_ID": "YOUR_APPLICATION_ID",
-  "DISCORD_TOKEN": "YOUR_BOT_TOKEN",
-  "SERIAL_PORT": "/dev/ttyUSB0",
-  "GUILD_IDS": ["YOUR_SERVER_ID"],
-  "DISCORD_CHANNEL_ID": "YOUR_PRIMARY_CHANNEL_ID",
-  "DISCORD_CHANNEL_ID_MESHMONDAY": "",
-  "IMGBB_API_KEY": "YOUR_IMGBB_API_KEY",
-  "DEBUG": false,
-  "DISCORD_ROUTES": {
-    "0": "DISCORD_CHANNEL_FOR_MESH_CH_0",
-    "1": "DISCORD_CHANNEL_FOR_MESH_CH_1"
-  },
-  "DISCORD_TO_MESH_ROUTES": {
-    "DISCORD_CHANNEL_ID": 0,
-    "ANOTHER_CHANNEL_ID": 1
-  },
-  "DISCORD_ALWAYS_FORWARD_CHANNEL_IDS": [
-    "CHANNEL_ID_1",
-    "CHANNEL_ID_2"
-  ],
-  "BRIDGE_PREFIXES": ["txtMesh 💬"],
-  "BRIDGE_ADMIN_ROLE_IDS": [],
-  "NODE_ANNOUNCE_CHANNEL_ID": "",
-  "FLOOD_PROTECT": {
-    "WINDOW_SECONDS": 15,
-    "MAX_MESSAGES_PER_WINDOW": 6,
-    "COOLDOWN_SECONDS": 300,
-    "WARN_IN_CHANNEL": true
-  },
-  "MESH_MAXLEN": 120,
-  "MESH_CHUNK_DELAY_MS": 4000
-}
+```bash
+node setup.js
 ```
 
-#### Config Reference
-
-| Key | Description |
-|-----|-------------|
-| `identifier` | Prefix for legacy text commands (e.g. `!send`) |
-| `CLIENT_ID` | Discord application ID |
-| `DISCORD_TOKEN` | Discord bot token |
-| `SERIAL_PORT` | USB serial port for MeshCore device |
-| `GUILD_IDS` | Array of Discord server IDs for slash command registration |
-| `DISCORD_CHANNEL_ID` | Default Discord channel for messages |
-| `DISCORD_CHANNEL_ID_MESHMONDAY` | Optional channel for #meshmonday messages |
-| `IMGBB_API_KEY` | ImgBB API key for image uploads |
-| `DEBUG` | Enable verbose debug logging |
-| `DISCORD_ROUTES` | Maps mesh channel index to Discord channel ID (mesh -> Discord) |
-| `DISCORD_TO_MESH_ROUTES` | Maps Discord channel ID to mesh channel index (Discord -> mesh) |
-| `DISCORD_ALWAYS_FORWARD_CHANNEL_IDS` | Channels that auto-forward all messages to mesh |
-| `BRIDGE_PREFIXES` | Array of other bridge node names to strip (e.g. `["txtMesh 💬"]`) |
-| `BRIDGE_ADMIN_ROLE_IDS` | Discord role IDs allowed to use admin commands |
-| `NODE_ANNOUNCE_CHANNEL_ID` | Channel for new node announcements (defaults to primary channel) |
-| `FLOOD_PROTECT` | Rate limiting settings for Discord -> mesh |
-| `MESH_MAXLEN` | Max message length for mesh (default 120) |
-| `MESH_CHUNK_DELAY_MS` | Delay between chunked message parts in ms |
+Or create `config.json` manually in the root directory (this file is gitignored). See [Config Reference](#config-reference) below for all options.
 
 ---
 
@@ -146,25 +99,40 @@ node main.js
 ## Features
 
 ### Mesh to Discord
-- **Webhook-based display** — Mesh users appear with their own username and unique auto-generated avatar in Discord
-- **Reaction mirroring** — Emoji reactions from MeshCoreOne are applied as native Discord reactions on the correct message (hash-compatible with MeshCoreOne's Crockford Base32 algorithm)
-- **Bridge prefix stripping** — Configurable list of other bridge prefixes to strip (e.g. `txtMesh 💬:`)
-- **Message deduplication** — Duplicate messages from multiple bridges are detected and dropped (30-second window)
-- **Node join announcements** — New mesh nodes are announced in Discord when first discovered
-- **Profanity filter** — Configurable language warning sent back to mesh
+- **Webhook-based display** -- Mesh users appear with their own username and unique auto-generated avatar in Discord
+- **Reaction mirroring** -- Emoji reactions from MeshCoreOne are applied as native Discord reactions on the correct message (hash-compatible with MeshCoreOne's Crockford Base32 algorithm)
+- **Bridge prefix stripping** -- Configurable list of other bridge node names to strip (e.g. `txtMesh`)
+- **Message deduplication** -- Duplicate messages from multiple bridges are detected and dropped (30-second window)
+- **Node join announcements** -- New mesh nodes are announced in Discord when first discovered
+- **Unmapped channel labels** -- Messages from mesh channels without a Discord route are labeled with the channel name
+- **Profanity filter** -- Language warning sent back to mesh
 
 ### Discord to Mesh
-- **Always-forward channels** — Designated Discord channels automatically relay all messages to mesh
-- **Image uploads** — Images posted in Discord are uploaded to ImgBB, shortened via TinyURL, and the link is sent to mesh
-- **Reaction mirroring** — Discord emoji reactions on bridged messages are sent to mesh in MeshCoreOne-compatible format
-- **`[D]` tag** — Discord-origin messages are tagged with `[D]` so mesh users can identify them
-- **Message chunking** — Long messages are split with `n/N` counters and paced to avoid mesh overload
-- **Flood protection** — Per-channel rate limiting prevents accidental mesh spam
+- **Always-forward channels** -- Designated Discord channels automatically relay all messages to mesh
+- **Image uploads** -- Images posted in Discord are uploaded to ImgBB and the link is sent to mesh
+- **File attachments** -- Non-image files are sent with file type, size, and a shortened link (e.g. `[PDF, 1.4MB] https://tinyurl.com/...`)
+- **Reaction mirroring** -- Discord emoji reactions on bridged messages are sent to mesh in MeshCoreOne-compatible format with correct hash
+- **`[D]` tag** -- Discord-origin messages are tagged with `[D]` so mesh users can identify them
+- **Message chunking** -- Long messages are split with `n/N` counters and paced to avoid mesh overload
+- **Flood protection** -- Per-channel rate limiting prevents accidental mesh spam
+
+### Emergency Channel
+- **@everyone alerts** -- First message on the emergency mesh channel pings `@everyone` in Discord
+- **Auto-reply** -- Sends a confirmation message back to mesh ("Your message has been forwarded...")
+- **Reminder pings** -- If no Discord user responds within a configurable time (default 5 min), pings `@everyone` again
+- **Cooldown** -- Configurable cooldown (default 30 min) before a new alert cycle can trigger
+
+### Channel Subscriptions
+- **Reaction-based roles** -- Users react to a message to subscribe/unsubscribe from mesh channels
+- **Auto-setup** -- `/subscribe-setup` creates roles, sets channel permissions, and posts the subscription message
+- **Channel visibility** -- Subscribed channels are visible only to users with the corresponding role
+- **Public channels** -- Public and emergency channels remain visible to everyone
 
 ### Bridge Controls
-- **Auto-reconnect** — Automatically reconnects if the USB serial connection drops
-- **Live config reload** — Reload `config.json` without restarting via `/bridge reload`
-- **Pause/resume** — Temporarily halt all forwarding in both directions
+- **Auto-reconnect** -- Automatically reconnects if the USB serial connection drops
+- **Live config reload** -- Reload `config.json` without restarting via `/bridge reload`
+- **Pause/resume** -- Temporarily halt all forwarding in both directions
+- **Persistent message history** -- Reaction hash tracking survives restarts (saved to disk)
 
 ---
 
@@ -183,8 +151,85 @@ Use `/meshhelp` in Discord to see all available commands.
 | `/bridge pause` | Pause forwarding | Admin |
 | `/bridge resume` | Resume forwarding | Admin |
 | `/bridge reload` | Reload config.json | Admin |
+| `/subscribe-setup` | Post channel subscription message | Admin |
 
 Legacy prefix commands (`!send`, `!advert`) are also supported using the configured `identifier`.
+
+---
+
+## Config Reference
+
+Run `node setup.js` for guided configuration. Below is a reference of all config keys.
+
+### Core Settings
+
+| Key | Description |
+|-----|-------------|
+| `identifier` | Prefix for legacy text commands (e.g. `!` means `!send`) |
+| `CLIENT_ID` | Discord Application ID (Developer Portal > General Information) |
+| `DISCORD_TOKEN` | Discord bot token (Developer Portal > Bot) |
+| `SERIAL_PORT` | USB serial port for MeshCore device (e.g. `/dev/ttyUSB0`) |
+| `GUILD_IDS` | Array of Discord server IDs for slash command registration |
+| `MESH_NODE_NAME` | Your bridge's MeshCore device name (used for outgoing reaction targeting) |
+
+### Channel Routing
+
+| Key | Description |
+|-----|-------------|
+| `DISCORD_CHANNEL_ID` | Default/fallback Discord channel for messages |
+| `DISCORD_ROUTES` | Maps mesh channel index to Discord channel ID (mesh to Discord) |
+| `DISCORD_TO_MESH_ROUTES` | Maps Discord channel ID to mesh channel index (Discord to mesh) |
+| `DISCORD_ALWAYS_FORWARD_CHANNEL_IDS` | Discord channels that auto-forward all messages to mesh |
+| `DISCORD_CHANNEL_ID_MESHMONDAY` | Optional channel for messages containing `#meshmonday` |
+
+### Image & File Uploads
+
+| Key | Description |
+|-----|-------------|
+| `IMGBB_API_KEY` | ImgBB API key for image uploads (get one at [api.imgbb.com](https://api.imgbb.com)) |
+
+### Emergency Channel
+
+| Key | Description |
+|-----|-------------|
+| `EMERGENCY_MESH_CHANNEL_IDX` | Mesh channel index for emergency messages |
+| `EMERGENCY_DISCORD_CHANNEL_ID` | Discord channel ID for emergency alerts |
+| `EMERGENCY_COOLDOWN_MINUTES` | Minutes before a new alert cycle can trigger (default `30`) |
+| `EMERGENCY_REMINDER_MINUTES` | Minutes before re-pinging if no Discord reply (default `5`) |
+
+### Channel Subscriptions
+
+| Key | Description |
+|-----|-------------|
+| `SUBSCRIBE_CHANNEL_ID` | Discord channel where the subscription message is posted |
+| `SUBSCRIBE_MESSAGE_ID` | Auto-populated after running `/subscribe-setup` |
+| `SUBSCRIBABLE_CHANNELS` | Array of `{ name, emoji, discordChannelId }` objects |
+| `_SUBSCRIBE_ROLE_MAP` | Auto-populated role mapping (do not edit manually) |
+
+### Bridge Configuration
+
+| Key | Description |
+|-----|-------------|
+| `BRIDGE_PREFIXES` | Array of other bridge node names to strip from messages |
+| `BRIDGE_ADMIN_ROLE_IDS` | Discord role IDs allowed to use admin commands |
+| `NODE_ANNOUNCE_CHANNEL_ID` | Channel for new node announcements (falls back to default) |
+| `DEBUG` | Enable verbose debug logging (`true`/`false`) |
+
+### Message Handling
+
+| Key | Description |
+|-----|-------------|
+| `MESH_MAXLEN` | Max message length for mesh in characters (default `120`) |
+| `MESH_CHUNK_DELAY_MS` | Delay in ms between chunked message parts (default `4000`) |
+
+### Flood Protection (`FLOOD_PROTECT`)
+
+| Key | Description |
+|-----|-------------|
+| `WINDOW_SECONDS` | Sliding window duration for rate limiting (default `15`) |
+| `MAX_MESSAGES_PER_WINDOW` | Max messages allowed per window before cooldown (default `6`) |
+| `COOLDOWN_SECONDS` | How long to block forwarding after limit is hit (default `300`) |
+| `WARN_IN_CHANNEL` | Post a warning in Discord when flood protection triggers (`true`/`false`) |
 
 ---
 
