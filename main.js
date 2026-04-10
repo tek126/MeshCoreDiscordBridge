@@ -542,6 +542,50 @@ async function floodAllowDiscordToMesh(messageLike) {
   return true;
 }
 
+/** =========================
+ * Emergency channel handling
+ * ========================= */
+const emergencyState = {
+  active: false,
+  lastAlertAt: 0,
+  reminderTimer: null,
+};
+
+const EMERGENCY_COOLDOWN_MS = Math.max(1, Number(config.EMERGENCY_COOLDOWN_MINUTES ?? 30)) * 60 * 1000;
+const EMERGENCY_REMINDER_MS = Math.max(1, Number(config.EMERGENCY_REMINDER_MINUTES ?? 5)) * 60 * 1000;
+
+function isEmergencyMeshChannel(channelIdx) {
+  const idx = config.EMERGENCY_MESH_CHANNEL_IDX;
+  if (idx === undefined || idx === null) return false;
+  return Number(channelIdx) === Number(idx);
+}
+
+function getEmergencyDiscordChannelId() {
+  return config.EMERGENCY_DISCORD_CHANNEL_ID || null;
+}
+
+function cancelEmergencyReminder() {
+  if (emergencyState.reminderTimer) {
+    clearTimeout(emergencyState.reminderTimer);
+    emergencyState.reminderTimer = null;
+  }
+}
+
+function scheduleEmergencyReminder(discordChannelId) {
+  cancelEmergencyReminder();
+  emergencyState.reminderTimer = setTimeout(async () => {
+    emergencyState.reminderTimer = null;
+    try {
+      const dest = await bot.channels.fetch(discordChannelId);
+      if (dest?.isTextBased()) {
+        await dest.send("🚨 No response yet — emergency message still awaiting reply @everyone");
+      }
+    } catch (e) {
+      console.error("Emergency reminder error:", e);
+    }
+  }, EMERGENCY_REMINDER_MS);
+}
+
 // Make sure we can read message content
 const commands = [
   new SlashCommandBuilder()
@@ -796,9 +840,85 @@ async function onMeshChannelMessageReceived(channelMessage) {
     }
   }
 
+  // Emergency channel handling
+  if (isEmergencyMeshChannel(channelIdx)) {
+    const emergencyChannelId = getEmergencyDiscordChannelId();
+    if (emergencyChannelId) {
+      try {
+        const dest = await bot.channels.fetch(emergencyChannelId);
+        if (dest?.isTextBased()) {
+          const now = Date.now();
+          const isNewEmergency = !emergencyState.active || (now - emergencyState.lastAlertAt) > EMERGENCY_COOLDOWN_MS;
+
+          if (isNewEmergency) {
+            // First message — send alert, forward message, reply to mesh
+            emergencyState.active = true;
+            emergencyState.lastAlertAt = now;
+
+            await dest.send("🚨 **Emergency Message Incoming** @everyone");
+
+            // Forward the message via webhook
+            let cleaned = stripBridgePrefixes(text);
+            const colonIdx = cleaned.indexOf(": ");
+            let senderName, meshBody;
+            if (colonIdx > 0 && colonIdx < 30) {
+              senderName = cleaned.slice(0, colonIdx).trim();
+              meshBody = cleaned.slice(colonIdx + 2).trim();
+            } else {
+              senderName = "Mesh";
+              meshBody = cleaned;
+            }
+
+            const webhook = await getOrCreateWebhook(dest);
+            if (webhook) {
+              const avatarURL = `https://api.dicebear.com/9.x/identicon/png?seed=${encodeURIComponent(senderName)}&size=128`;
+              await webhook.send({ content: meshBody, username: senderName, avatarURL });
+            } else {
+              await dest.send(`**${senderName}:** ${meshBody}`);
+            }
+
+            // Reply to mesh
+            await enqueueMeshSend(() =>
+              connection.sendChannelTextMessage(channelIdx,
+                "Your message has been forwarded to Discord. Stand by for a reply. This channel is for emergency use only.")
+            );
+
+            // Start reminder timer
+            scheduleEmergencyReminder(emergencyChannelId);
+          } else {
+            // Subsequent message — just forward, no ping or reply
+            let cleaned = stripBridgePrefixes(text);
+            const colonIdx = cleaned.indexOf(": ");
+            let senderName, meshBody;
+            if (colonIdx > 0 && colonIdx < 30) {
+              senderName = cleaned.slice(0, colonIdx).trim();
+              meshBody = cleaned.slice(colonIdx + 2).trim();
+            } else {
+              senderName = "Mesh";
+              meshBody = cleaned;
+            }
+
+            const webhook = await getOrCreateWebhook(dest);
+            if (webhook) {
+              const avatarURL = `https://api.dicebear.com/9.x/identicon/png?seed=${encodeURIComponent(senderName)}&size=128`;
+              await webhook.send({ content: meshBody, username: senderName, avatarURL });
+            } else {
+              await dest.send(`**${senderName}:** ${meshBody}`);
+            }
+          }
+        }
+      } catch (e) {
+        console.error("Emergency channel error:", e);
+      }
+      return; // Don't process through normal routing
+    }
+  }
+
   // Route by Meshcore channel index
-  const routeChannelId = config.DISCORD_ROUTES?.[String(channelIdx)] ?? config.DISCORD_CHANNEL_ID;
+  const explicitRoute = config.DISCORD_ROUTES?.[String(channelIdx)];
+  const routeChannelId = explicitRoute ?? config.DISCORD_CHANNEL_ID;
   if (!routeChannelId) return;
+  const isUnmappedChannel = !explicitRoute;
 
   try {
     const dest = await bot.channels.fetch(routeChannelId);
@@ -826,15 +946,27 @@ async function onMeshChannelMessageReceived(channelMessage) {
       meshBody = cleaned;
     }
 
+    // Flag unmapped channels so it's clear the message came from an unexpected source
+    let channelTag = "";
+    if (isUnmappedChannel) {
+      try {
+        const chInfo = await connection.getChannel(channelIdx);
+        const chName = chInfo?.name || `ch ${channelIdx}`;
+        channelTag = `[${chName}] `;
+      } catch {
+        channelTag = `[Mesh ch ${channelIdx}] `;
+      }
+    }
+
     // Send via webhook so the sender name appears as the message author
     let sentMsg;
     const webhook = await getOrCreateWebhook(dest);
     if (webhook) {
       const avatarURL = `https://api.dicebear.com/9.x/identicon/png?seed=${encodeURIComponent(senderName)}&size=128`;
-      sentMsg = await webhook.send({ content: meshBody, username: senderName, avatarURL });
+      sentMsg = await webhook.send({ content: `${channelTag}${meshBody}`, username: senderName, avatarURL });
     } else {
       // Fallback to bot message if webhook fails
-      sentMsg = await dest.send(`**${senderName}:** ${meshBody}`);
+      sentMsg = await dest.send(`${channelTag}**${senderName}:** ${meshBody}`);
     }
 
     // Track message for reaction matching
@@ -1162,6 +1294,13 @@ bot.on("messageCreate", async (message) => {
     // ignore bots and DMs
     if (message.author.bot) return;
     if (!message.guild) return;
+
+    // Emergency channel reply detection — cancel reminder if someone responds
+    const emergencyChannelId = getEmergencyDiscordChannelId();
+    if (emergencyChannelId && String(message.channel.id) === String(emergencyChannelId) && emergencyState.active) {
+      cancelEmergencyReminder();
+      if (config.DEBUG) console.debug("[debug] Emergency reminder cancelled — Discord reply received");
+    }
 
     // Always-forward mode for one specific Discord channel
     const alwaysForwardIds = getAlwaysForwardChannelIds();
