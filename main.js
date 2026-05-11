@@ -586,6 +586,160 @@ function scheduleEmergencyReminder(discordChannelId) {
   }, EMERGENCY_REMINDER_MS);
 }
 
+/** =========================
+ * Mesh user block system
+ * ========================= */
+// blockState tracks per-user daily warning and appeal status
+// key = lowercase sender name, value = { lastWarned: timestamp, lastAppeal: timestamp }
+const blockState = new Map();
+
+function getBlockList() {
+  return config.BLOCKED_MESH_USERS || [];
+}
+
+function isUserBlocked(senderName) {
+  const list = getBlockList();
+  const nameLower = senderName.toLowerCase();
+  return list.some(entry => {
+    const entryName = typeof entry === "string" ? entry : entry.name;
+    if (entryName?.toLowerCase() !== nameLower) return false;
+    // Check if vote-block has expired
+    if (entry.expiresAt && Date.now() > entry.expiresAt) return false;
+    return true;
+  });
+}
+
+function addBlockedUser(name, pubKeyHex = null, opts = {}) {
+  if (!config.BLOCKED_MESH_USERS) config.BLOCKED_MESH_USERS = [];
+  // Don't add duplicates
+  if (isUserBlocked(name)) return false;
+  const entry = { name };
+  if (pubKeyHex) entry.pubKey = pubKeyHex;
+  if (opts.type) entry.type = opts.type; // "admin" or "vote"
+  if (opts.expiresAt) entry.expiresAt = opts.expiresAt;
+  if (opts.voteCount !== undefined) entry.voteCount = opts.voteCount;
+  config.BLOCKED_MESH_USERS.push(entry);
+  saveConfig();
+  return true;
+}
+
+function removeBlockedUser(name) {
+  if (!config.BLOCKED_MESH_USERS) return false;
+  const nameLower = name.toLowerCase();
+  const before = config.BLOCKED_MESH_USERS.length;
+  config.BLOCKED_MESH_USERS = config.BLOCKED_MESH_USERS.filter(entry => {
+    const entryName = typeof entry === "string" ? entry : entry.name;
+    return entryName?.toLowerCase() !== nameLower;
+  });
+  if (config.BLOCKED_MESH_USERS.length < before) {
+    saveConfig();
+    return true;
+  }
+  return false;
+}
+
+function saveConfig() {
+  try {
+    fs.writeFileSync('./config.json', JSON.stringify(config, null, 2));
+  } catch (e) {
+    console.error("Failed to save config:", e);
+  }
+}
+
+function getBlockState(senderName) {
+  const key = senderName.toLowerCase();
+  let state = blockState.get(key);
+  if (!state) {
+    state = { lastWarned: 0, lastAppeal: 0 };
+    blockState.set(key, state);
+  }
+  return state;
+}
+
+/** =========================
+ * Vote-block system
+ * ========================= */
+const VOTE_DURATION_MS = 15 * 60 * 1000; // 15 minutes
+const VOTE_COOLDOWN_MS = 4 * 60 * 60 * 1000; // 4 hours
+const VOTE_MIN_YES = 3;
+const VOTE_PERCENT = 0.10; // 10%
+const VOTE_BLOCK_DAYS = [4, 8, 0]; // escalation: 4 days, 8 days, permanent (0 = permanent)
+const VOTE_VETO_EMOJI = "❌";
+
+// Active votes: Map<messageId, { username, reason, channelId, guildId, timer, initiator }>
+const activeVotes = new Map();
+// Cooldowns: Map<lowercase username, timestamp of last vote attempt>
+const voteCooldowns = new Map();
+
+function getVoteBlockCount(username) {
+  // Count how many times this user has been vote-blocked before (from config)
+  const history = config.VOTE_BLOCK_HISTORY || {};
+  return history[username.toLowerCase()] || 0;
+}
+
+function recordVoteBlock(username) {
+  if (!config.VOTE_BLOCK_HISTORY) config.VOTE_BLOCK_HISTORY = {};
+  const key = username.toLowerCase();
+  config.VOTE_BLOCK_HISTORY[key] = (config.VOTE_BLOCK_HISTORY[key] || 0) + 1;
+  saveConfig();
+}
+
+function getVoteBlockDuration(username) {
+  const count = getVoteBlockCount(username);
+  const idx = Math.min(count, VOTE_BLOCK_DAYS.length - 1);
+  return VOTE_BLOCK_DAYS[idx]; // days, 0 = permanent
+}
+
+// Check for expired vote-blocks periodically and notify
+function startBlockExpiryChecker() {
+  setInterval(async () => {
+    if (!config.BLOCKED_MESH_USERS) return;
+    const now = Date.now();
+    const expired = [];
+    config.BLOCKED_MESH_USERS = config.BLOCKED_MESH_USERS.filter(entry => {
+      if (entry.expiresAt && now > entry.expiresAt) {
+        expired.push(entry);
+        return false;
+      }
+      return true;
+    });
+    if (expired.length > 0) {
+      saveConfig();
+      for (const entry of expired) {
+        // Notify on mesh
+        try {
+          await enqueueMeshSend(() =>
+            connection.sendChannelTextMessage(0,
+              `${entry.name}: Your block has expired. Please follow community guidelines.`)
+          );
+        } catch (e) {
+          console.error("Block expiry mesh notify error:", e);
+        }
+        // Notify on Discord
+        const announceId = config.NODE_ANNOUNCE_CHANNEL_ID || config.DISCORD_CHANNEL_ID;
+        if (announceId) {
+          try {
+            const dest = await bot.channels.fetch(announceId);
+            if (dest?.isTextBased()) {
+              await dest.send(`Vote-block expired for **${entry.name}**. They can now send messages again.`);
+            }
+          } catch (e) {
+            console.error("Block expiry Discord notify error:", e);
+          }
+        }
+      }
+    }
+  }, 60_000); // Check every minute
+}
+
+function isSameDay(ts1, ts2) {
+  const d1 = new Date(ts1);
+  const d2 = new Date(ts2);
+  return d1.getFullYear() === d2.getFullYear() &&
+    d1.getMonth() === d2.getMonth() &&
+    d1.getDate() === d2.getDate();
+}
+
 // Make sure we can read message content
 const commands = [
   new SlashCommandBuilder()
@@ -621,6 +775,46 @@ const commands = [
   new SlashCommandBuilder()
     .setName("subscribe-setup")
     .setDescription("Post the channel subscription message (admin only)"),
+
+  new SlashCommandBuilder()
+    .setName("subscribe-refresh")
+    .setDescription("Update the subscription message and sync new channels (admin only)"),
+
+  new SlashCommandBuilder()
+    .setName("block")
+    .setDescription("Block a mesh user from being forwarded to Discord (admin)")
+    .addStringOption(opt =>
+      opt.setName("username")
+        .setDescription("Mesh username to block")
+        .setRequired(true)
+    ),
+
+  new SlashCommandBuilder()
+    .setName("unblock")
+    .setDescription("Unblock a mesh user (admin)")
+    .addStringOption(opt =>
+      opt.setName("username")
+        .setDescription("Mesh username to unblock")
+        .setRequired(true)
+    ),
+
+  new SlashCommandBuilder()
+    .setName("blocklist")
+    .setDescription("Show blocked mesh users"),
+
+  new SlashCommandBuilder()
+    .setName("voteblock")
+    .setDescription("Start a vote to block a mesh user")
+    .addStringOption(opt =>
+      opt.setName("username")
+        .setDescription("Mesh username to vote-block")
+        .setRequired(true)
+    )
+    .addStringOption(opt =>
+      opt.setName("reason")
+        .setDescription("Reason for the block")
+        .setRequired(true)
+    ),
 
   // Bridge mode controls
   new SlashCommandBuilder()
@@ -664,6 +858,8 @@ const bot = new Client({
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
     GatewayIntentBits.GuildMessageReactions,
+    GatewayIntentBits.GuildPresences,
+    GatewayIntentBits.GuildMembers,
   ],
   partials: [Partials.Message, Partials.Reaction],
 });
@@ -844,6 +1040,66 @@ async function onMeshChannelMessageReceived(channelMessage) {
     }
   }
 
+  // Block system — check if sender is blocked
+  const senderColonIdx = text.indexOf(": ");
+  const meshSenderName = senderColonIdx > 0 && senderColonIdx < 30
+    ? text.slice(0, senderColonIdx).trim()
+    : null;
+
+  // Also check after bridge prefix stripping
+  const strippedText = stripBridgePrefixes(text);
+  const strippedColonIdx = strippedText.indexOf(": ");
+  const strippedSenderName = strippedColonIdx > 0 && strippedColonIdx < 30
+    ? strippedText.slice(0, strippedColonIdx).trim()
+    : null;
+
+  const senderToCheck = strippedSenderName || meshSenderName;
+
+  if (senderToCheck && isUserBlocked(senderToCheck)) {
+    const now = Date.now();
+    const state = getBlockState(senderToCheck);
+    const msgBody = strippedColonIdx > 0 ? strippedText.slice(strippedColonIdx + 2).trim() : text.trim();
+
+    // Check for appeal
+    if (msgBody.toLowerCase() === "appeal") {
+      if (!isSameDay(state.lastAppeal, now)) {
+        state.lastAppeal = now;
+        // Forward the appeal to the routed Discord channel
+        const routeChannelId = config.DISCORD_ROUTES?.[String(channelIdx)] ?? config.DISCORD_CHANNEL_ID;
+        if (routeChannelId) {
+          try {
+            const dest = await bot.channels.fetch(routeChannelId);
+            if (dest?.isTextBased()) {
+              await dest.send(`**[APPEAL from ${senderToCheck}]:** User is requesting to be unblocked.`);
+            }
+          } catch (e) {
+            console.error("Appeal forward error:", e);
+          }
+        }
+        await enqueueMeshSend(() =>
+          connection.sendChannelTextMessage(channelIdx, "Your appeal has been forwarded.")
+        );
+      } else {
+        await enqueueMeshSend(() =>
+          connection.sendChannelTextMessage(channelIdx, "You have already submitted an appeal today.")
+        );
+      }
+      return;
+    }
+
+    // Daily warning
+    if (!isSameDay(state.lastWarned, now)) {
+      state.lastWarned = now;
+      await enqueueMeshSend(() =>
+        connection.sendChannelTextMessage(channelIdx,
+          "You are blocked from Discord. Reply \"appeal\" once daily to request an unblock.")
+      );
+    }
+
+    if (config.DEBUG) console.debug(`[debug] Blocked message from ${senderToCheck}`);
+    return;
+  }
+
   // Emergency channel handling
   if (isEmergencyMeshChannel(channelIdx)) {
     const emergencyChannelId = getEmergencyDiscordChannelId();
@@ -1002,6 +1258,7 @@ bot.once("ready", async () => {
   console.log(`Logged in as ${bot.user.tag}!`);
   console.log('Listening for commands: !advert, !send <message>');
   discordChannel = await bot.channels.fetch(config.DISCORD_CHANNEL_ID);
+  startBlockExpiryChecker();
 });
 
 async function handleAdvert(reply) {
@@ -1060,6 +1317,11 @@ bot.on("interactionCreate", async (interaction) => {
         "`/bridge resume` — Resume message forwarding (admin)",
         "`/bridge reload` — Reload config without restarting (admin)",
         "`/subscribe-setup` — Post channel subscription message (admin)",
+        "`/subscribe-refresh` — Update subscription message with new channels (admin)",
+        "`/block <username>` — Block a mesh user from Discord forwarding (admin)",
+        "`/unblock <username>` — Unblock a mesh user (admin)",
+        "`/blocklist` — Show blocked mesh users",
+        "`/voteblock <username> <reason>` — Start a community vote to block a mesh user",
         "",
         "Messages in forwarding channels are automatically relayed to mesh.",
         "Reactions on bridged messages are mirrored to/from mesh.",
@@ -1169,6 +1431,101 @@ bot.on("interactionCreate", async (interaction) => {
       } catch (e) {
         console.error("Subscribe setup error:", e);
         await interaction.editReply(`Setup failed: ${e.message}`);
+      }
+      return;
+    }
+
+    if (interaction.commandName === "subscribe-refresh") {
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+      if (!isBridgeAdminMember(interaction.member)) {
+        await interaction.editReply("Not authorized.");
+        return;
+      }
+
+      const subscribeChannelId = config.SUBSCRIBE_CHANNEL_ID;
+      const subscribeMessageId = config.SUBSCRIBE_MESSAGE_ID;
+
+      if (!subscribeChannelId || !subscribeMessageId) {
+        await interaction.editReply("No subscription message found. Run `/subscribe-setup` first.");
+        return;
+      }
+
+      const subscribableChannels = config.SUBSCRIBABLE_CHANNELS || [];
+      const guild = interaction.guild;
+
+      try {
+        const subChannel = await bot.channels.fetch(subscribeChannelId);
+        const subMsg = await subChannel.messages.fetch(subscribeMessageId);
+
+        // Ensure roles exist for any new channels and build updated role map
+        const roleMap = [];
+        for (const ch of subscribableChannels) {
+          const roleName = `Mesh: ${ch.name}`;
+          let role = guild.roles.cache.find(r => r.name === roleName);
+          if (!role) {
+            role = await guild.roles.create({
+              name: roleName,
+              reason: "MeshCore channel subscription",
+            });
+          }
+
+          // Set channel permissions
+          const discordChannel = await bot.channels.fetch(ch.discordChannelId).catch(() => null);
+          if (discordChannel) {
+            await discordChannel.permissionOverwrites.edit(guild.id, {
+              ViewChannel: false,
+            }).catch(e => console.error(`Failed to set @everyone perms for ${ch.name}:`, e));
+
+            await discordChannel.permissionOverwrites.edit(role.id, {
+              ViewChannel: true,
+            }).catch(e => console.error(`Failed to set role perms for ${ch.name}:`, e));
+
+            await discordChannel.permissionOverwrites.edit(bot.user.id, {
+              ViewChannel: true,
+              SendMessages: true,
+              ManageWebhooks: true,
+            }).catch(e => console.error(`Failed to set bot perms for ${ch.name}:`, e));
+          }
+
+          roleMap.push({ emoji: ch.emoji, roleId: role.id, name: ch.name });
+        }
+
+        // Update the message text
+        const lines = [
+          "**Mesh Channel Subscriptions**",
+          "",
+          "React to join/leave channels:",
+          "",
+        ];
+        for (const entry of roleMap) {
+          lines.push(`${entry.emoji}  \`${entry.name}\``);
+        }
+        lines.push("", "_Remove your reaction to unsubscribe._");
+
+        await subMsg.edit(lines.join("\n"));
+
+        // Add any missing reactions (preserves existing ones)
+        const existingReactions = subMsg.reactions.cache;
+        for (const entry of roleMap) {
+          const hasReaction = existingReactions.some(r => r.emoji.name === entry.emoji);
+          if (!hasReaction) {
+            await subMsg.react(entry.emoji);
+          }
+        }
+
+        // Save updated role map
+        config._SUBSCRIBE_ROLE_MAP = roleMap;
+        try {
+          fs.writeFileSync('./config.json', JSON.stringify(config, null, 2));
+        } catch (e) {
+          console.error("Failed to save config:", e);
+        }
+
+        await interaction.editReply(`Subscription message updated! (${roleMap.length} channels)`);
+      } catch (e) {
+        console.error("Subscribe refresh error:", e);
+        await interaction.editReply(`Refresh failed: ${e.message}`);
       }
       return;
     }
@@ -1340,6 +1697,201 @@ bot.on("interactionCreate", async (interaction) => {
           await interaction.editReply(`Failed to get status for "${name}".`);
         }
       }
+      return;
+    }
+
+    if (interaction.commandName === "block") {
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+      if (!isBridgeAdminMember(interaction.member)) {
+        await interaction.editReply("Not authorized.");
+        return;
+      }
+      const username = interaction.options.getString("username");
+
+      // Try to find the contact to get their public key
+      let pubKeyHex = null;
+      try {
+        const contact = await connection.findContactByName(username);
+        if (contact?.publicKey) {
+          pubKeyHex = Buffer.from(contact.publicKey).toString("hex");
+        }
+      } catch {}
+
+      if (addBlockedUser(username, pubKeyHex)) {
+        // Send warning to mesh on public channel
+        await enqueueMeshSend(() =>
+          connection.sendChannelTextMessage(0,
+            `${username}: You have been blocked from Discord. Reply "appeal" once daily to request an unblock.`)
+        );
+        await interaction.editReply(`Blocked **${username}**${pubKeyHex ? ` (key: ${pubKeyHex.slice(0, 12)}...)` : ""}. Their messages will no longer be forwarded to Discord. Warning sent to mesh.`);
+      } else {
+        await interaction.editReply(`**${username}** is already blocked.`);
+      }
+      return;
+    }
+
+    if (interaction.commandName === "unblock") {
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+      if (!isBridgeAdminMember(interaction.member)) {
+        await interaction.editReply("Not authorized.");
+        return;
+      }
+      const username = interaction.options.getString("username");
+      if (removeBlockedUser(username)) {
+        await interaction.editReply(`Unblocked **${username}**.`);
+      } else {
+        await interaction.editReply(`**${username}** is not on the block list.`);
+      }
+      return;
+    }
+
+    if (interaction.commandName === "blocklist") {
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+      const list = getBlockList();
+      if (list.length === 0) {
+        await interaction.editReply("No blocked users.");
+      } else {
+        const now = Date.now();
+        const lines = list.map(entry => {
+          const name = typeof entry === "string" ? entry : entry.name;
+          const key = entry.pubKey ? ` (${entry.pubKey.slice(0, 12)}...)` : "";
+          const type = entry.type === "vote" ? " [vote]" : " [admin]";
+          let expiry = "";
+          if (entry.expiresAt) {
+            if (now > entry.expiresAt) {
+              expiry = " — *expired*";
+            } else {
+              expiry = ` — expires <t:${Math.floor(entry.expiresAt / 1000)}:R>`;
+            }
+          }
+          return `- **${name}**${key}${type}${expiry}`;
+        });
+        await interaction.editReply(`**Blocked Users (${list.length}):**\n${lines.join("\n")}`);
+      }
+      return;
+    }
+
+    if (interaction.commandName === "voteblock") {
+      const username = interaction.options.getString("username");
+      const reason = interaction.options.getString("reason");
+
+      // Check if already blocked
+      if (isUserBlocked(username)) {
+        await interaction.reply({ content: `**${username}** is already blocked.`, flags: MessageFlags.Ephemeral });
+        return;
+      }
+
+      // Check cooldown
+      const cooldownKey = username.toLowerCase();
+      const lastVote = voteCooldowns.get(cooldownKey) || 0;
+      if (Date.now() - lastVote < VOTE_COOLDOWN_MS) {
+        const remaining = Math.ceil((VOTE_COOLDOWN_MS - (Date.now() - lastVote)) / 60000);
+        await interaction.reply({ content: `A vote for **${username}** was attempted recently. Try again in ${remaining} minutes.`, flags: MessageFlags.Ephemeral });
+        return;
+      }
+
+      // Check if there's already an active vote for this user
+      for (const vote of activeVotes.values()) {
+        if (vote.username.toLowerCase() === cooldownKey) {
+          await interaction.reply({ content: `A vote for **${username}** is already in progress.`, flags: MessageFlags.Ephemeral });
+          return;
+        }
+      }
+
+      // Get online member count for threshold
+      const guild = interaction.guild;
+      const onlineMembers = guild.members.cache.filter(m => !m.user.bot && m.presence?.status && m.presence.status !== "offline").size;
+      const threshold = Math.max(VOTE_MIN_YES, Math.ceil(onlineMembers * VOTE_PERCENT));
+
+      // Escalation info
+      const blockDays = getVoteBlockDuration(username);
+      const durationText = blockDays === 0 ? "permanently" : `for ${blockDays} days`;
+      const priorBlocks = getVoteBlockCount(username);
+      const escalationNote = priorBlocks > 0 ? ` (prior blocks: ${priorBlocks})` : "";
+
+      // Post vote message
+      const voteMsg = await interaction.channel.send(
+        `**Vote to block \`${username}\` ${durationText}${escalationNote}**\n` +
+        `Reason: ${reason}\n` +
+        `Initiated by: ${interaction.user.username}\n\n` +
+        `React 👍 to vote yes, 👎 to vote no.\n` +
+        `Admins: react ${VOTE_VETO_EMOJI} to veto.\n` +
+        `Needs **${threshold}** yes votes. Closes <t:${Math.floor((Date.now() + VOTE_DURATION_MS) / 1000)}:R>.`
+      );
+
+      await voteMsg.react("👍");
+      await voteMsg.react("👎");
+      await voteMsg.react(VOTE_VETO_EMOJI);
+
+      voteCooldowns.set(cooldownKey, Date.now());
+
+      // Set timer to resolve the vote
+      const timer = setTimeout(async () => {
+        activeVotes.delete(voteMsg.id);
+        try {
+          // Refetch message to get updated reactions
+          const msg = await interaction.channel.messages.fetch(voteMsg.id);
+
+          // Check for admin veto
+          const vetoReaction = msg.reactions.cache.find(r => r.emoji.name === VOTE_VETO_EMOJI);
+          if (vetoReaction && vetoReaction.count > 1) { // >1 because bot reacted
+            // Check if any reactor is an admin
+            const vetoUsers = await vetoReaction.users.fetch();
+            const vetoed = vetoUsers.some(u => {
+              if (u.bot) return false;
+              const member = guild.members.cache.get(u.id);
+              return member && isBridgeAdminMember(member);
+            });
+            if (vetoed) {
+              await msg.reply(`Vote to block **${username}** was **vetoed** by an admin.`);
+              return;
+            }
+          }
+
+          // Count yes votes (subtract 1 for bot's reaction)
+          const yesReaction = msg.reactions.cache.find(r => r.emoji.name === "👍");
+          const yesCount = yesReaction ? yesReaction.count - 1 : 0;
+
+          if (yesCount >= threshold) {
+            // Vote passed
+            const blockDays = getVoteBlockDuration(username);
+            const expiresAt = blockDays > 0 ? Date.now() + (blockDays * 24 * 60 * 60 * 1000) : null;
+
+            let pubKeyHex = null;
+            try {
+              const contact = await connection.findContactByName(username);
+              if (contact?.publicKey) pubKeyHex = Buffer.from(contact.publicKey).toString("hex");
+            } catch {}
+
+            addBlockedUser(username, pubKeyHex, { type: "vote", expiresAt, voteCount: yesCount });
+            recordVoteBlock(username);
+
+            const durationText = blockDays === 0 ? "permanently" : `for ${blockDays} days`;
+            await msg.reply(`Vote passed (**${yesCount}**/${threshold}). **${username}** has been blocked ${durationText}.`);
+
+            // Warn on mesh
+            await enqueueMeshSend(() =>
+              connection.sendChannelTextMessage(0,
+                `${username}: You have been vote-blocked ${durationText}. Reply "appeal" once daily to request an unblock.`)
+            );
+          } else {
+            await msg.reply(`Vote failed (**${yesCount}**/${threshold} needed). **${username}** will not be blocked.`);
+          }
+        } catch (e) {
+          console.error("Vote resolution error:", e);
+        }
+      }, VOTE_DURATION_MS);
+
+      activeVotes.set(voteMsg.id, {
+        username,
+        reason,
+        channelId: interaction.channel.id,
+        guildId: guild.id,
+        timer,
+        initiator: interaction.user.username,
+      });
+
+      await interaction.reply({ content: `Vote to block **${username}** started!`, flags: MessageFlags.Ephemeral });
       return;
     }
 
