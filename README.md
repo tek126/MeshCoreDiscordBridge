@@ -100,7 +100,7 @@ node main.js
 
 ### Mesh to Discord
 - **Webhook-based display** -- Mesh users appear with their own username and unique auto-generated avatar in Discord
-- **Packet path display** -- Each message shows the repeater path it took in small text below the message (e.g. `2 hops: [ACE1] Westmere X2 → [C4] ESP | W`). Supports 1, 2, and 3-byte hash modes with automatic repeater name resolution from the contacts list
+- **Packet path display** -- Each message shows the repeater path it took in small text below the message (e.g. `2 hops: [ACE1] Westmere X2 → [C4] ESP | W`). Supports 1, 2, and 3-byte hash modes with automatic repeater name resolution from the contacts list and persistent backup
 - **Reaction mirroring** -- Emoji reactions from MeshCoreOne are applied as native Discord reactions on the correct message (hash-compatible with MeshCoreOne's Crockford Base32 algorithm)
 - **Bridge prefix stripping** -- Configurable list of other bridge node names to strip (e.g. `txtMesh`)
 - **Message deduplication** -- Duplicate messages from multiple bridges are detected and dropped (30-second window)
@@ -140,7 +140,8 @@ node main.js
 - **Auto-reconnect** -- Automatically reconnects if the USB serial connection drops
 - **Live config reload** -- Reload `config.json` without restarting via `/bridge reload`
 - **Pause/resume** -- Temporarily halt all forwarding in both directions
-- **Persistent message history** -- Reaction hash tracking survives restarts (saved to disk)
+- **Persistent message history** -- Reaction hash tracking survives restarts (saved to disk, 24-hour expiry)
+- **Contacts backup** -- Repeater/node names are backed up to disk for path resolution even after device resets
 
 ---
 

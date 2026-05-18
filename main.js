@@ -52,15 +52,23 @@ function generateMeshHash(text, senderTimestamp) {
 // ---- Message history for reaction matching (persisted to disk) ----
 // Maps mesh hash -> { discordMessageId, discordChannelId, meshText, senderTimestamp, meshChannelIdx }
 const HISTORY_FILE = './message_history.json';
-const MAX_HISTORY = 500;
+const HISTORY_MAX_AGE_MS = 24 * 60 * 60 * 1000; // 24 hours
 
 let messageHistory = new Map();
 
-// Load history from disk on startup
+// Load history from disk on startup, pruning expired entries
 try {
   const data = JSON.parse(fs.readFileSync(HISTORY_FILE, 'utf8'));
-  messageHistory = new Map(data);
-  console.log(`Loaded ${messageHistory.size} messages from history.`);
+  const now = Date.now();
+  let pruned = 0;
+  for (const [hash, entry] of data) {
+    if (entry.trackedAt && (now - entry.trackedAt) > HISTORY_MAX_AGE_MS) {
+      pruned++;
+    } else {
+      messageHistory.set(hash, entry);
+    }
+  }
+  console.log(`Loaded ${messageHistory.size} messages from history${pruned ? ` (pruned ${pruned} expired)` : ""}.`);
 } catch (e) {
   // File doesn't exist yet or is invalid — start fresh
 }
@@ -70,6 +78,13 @@ function scheduleSaveHistory() {
   if (historySaveTimer) return;
   historySaveTimer = setTimeout(() => {
     historySaveTimer = null;
+    // Prune expired entries before saving
+    const now = Date.now();
+    for (const [hash, entry] of messageHistory) {
+      if (entry.trackedAt && (now - entry.trackedAt) > HISTORY_MAX_AGE_MS) {
+        messageHistory.delete(hash);
+      }
+    }
     try {
       fs.writeFileSync(HISTORY_FILE, JSON.stringify([...messageHistory]));
     } catch (e) {
@@ -79,12 +94,8 @@ function scheduleSaveHistory() {
 }
 
 function trackMessage(hash, entry) {
+  entry.trackedAt = Date.now();
   messageHistory.set(hash, entry);
-  // Evict oldest if too large
-  if (messageHistory.size > MAX_HISTORY) {
-    const oldest = messageHistory.keys().next().value;
-    messageHistory.delete(oldest);
-  }
   scheduleSaveHistory();
 }
 
@@ -962,10 +973,40 @@ const rxFrameBuffer = []; // { timestamp, hopCount, prefixes, snr, rssi }
 const RX_FRAME_MAX_AGE_MS = 10_000; // discard frames older than 10s
 const RX_FRAME_MAX_BUFFER = 50;
 
-// Cache contacts for prefix lookup
+// Cache contacts for prefix lookup, with disk backup
+const CONTACTS_BACKUP_FILE = './contacts_backup.json';
 let contactsCache = [];
 let contactsCacheTime = 0;
 const CONTACTS_CACHE_TTL = 60_000; // refresh every 60s
+
+// Load backup contacts on startup
+let contactsBackup = new Map(); // pubKeyHex -> { name, type, pubKeyHex }
+try {
+  const data = JSON.parse(fs.readFileSync(CONTACTS_BACKUP_FILE, 'utf8'));
+  for (const entry of data) {
+    contactsBackup.set(entry.pubKeyHex, entry);
+  }
+  console.log(`Loaded ${contactsBackup.size} contacts from backup.`);
+} catch {
+  // No backup yet
+}
+
+function saveContactsBackup(contacts) {
+  for (const c of contacts) {
+    if (!c.publicKey || !c.advName) continue;
+    const pubKeyHex = Buffer.from(c.publicKey).toString("hex");
+    contactsBackup.set(pubKeyHex, {
+      name: c.advName,
+      type: c.type,
+      pubKeyHex,
+    });
+  }
+  try {
+    fs.writeFileSync(CONTACTS_BACKUP_FILE, JSON.stringify([...contactsBackup.values()]));
+  } catch (e) {
+    console.error("Failed to save contacts backup:", e);
+  }
+}
 
 async function getContactsCached() {
   const now = Date.now();
@@ -973,6 +1014,7 @@ async function getContactsCached() {
     try {
       contactsCache = await connection.getContacts();
       contactsCacheTime = now;
+      saveContactsBackup(contactsCache);
     } catch (e) {
       console.error("Failed to refresh contacts cache:", e);
     }
@@ -983,6 +1025,8 @@ async function getContactsCached() {
 function resolvePrefix(contacts, prefixBytes) {
   const prefixHex = Buffer.from(prefixBytes).toString("hex").toUpperCase();
   const prefixLen = prefixHex.length; // 2, 4, or 6 hex chars
+
+  // Try live contacts first
   const matches = [];
   for (const c of contacts) {
     if (!c.publicKey) continue;
@@ -991,6 +1035,16 @@ function resolvePrefix(contacts, prefixBytes) {
   }
   if (matches.length === 1) return `[${prefixHex}] ${matches[0]}`;
   if (matches.length > 1) return `[${prefixHex}] ?`;
+
+  // Fall back to backup contacts
+  const backupMatches = [];
+  for (const entry of contactsBackup.values()) {
+    const backupHex = entry.pubKeyHex.slice(0, prefixLen).toUpperCase();
+    if (backupHex === prefixHex && entry.name) backupMatches.push(entry.name);
+  }
+  if (backupMatches.length === 1) return `[${prefixHex}] ${backupMatches[0]}`;
+  if (backupMatches.length > 1) return `[${prefixHex}] ?`;
+
   return `[${prefixHex}]`;
 }
 
