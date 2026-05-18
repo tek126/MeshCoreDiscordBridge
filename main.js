@@ -957,6 +957,123 @@ connection.on(Constants.PushCodes.NewAdvert, async (contact) => {
   }
 });
 
+// ---- RX frame buffer for packet path decoding ----
+const rxFrameBuffer = []; // { timestamp, hopCount, prefixes, snr, rssi }
+const RX_FRAME_MAX_AGE_MS = 10_000; // discard frames older than 10s
+const RX_FRAME_MAX_BUFFER = 50;
+
+// Cache contacts for prefix lookup
+let contactsCache = [];
+let contactsCacheTime = 0;
+const CONTACTS_CACHE_TTL = 60_000; // refresh every 60s
+
+async function getContactsCached() {
+  const now = Date.now();
+  if (now - contactsCacheTime > CONTACTS_CACHE_TTL || contactsCache.length === 0) {
+    try {
+      contactsCache = await connection.getContacts();
+      contactsCacheTime = now;
+    } catch (e) {
+      console.error("Failed to refresh contacts cache:", e);
+    }
+  }
+  return contactsCache;
+}
+
+function resolvePrefix(contacts, prefixBytes) {
+  const prefixHex = Buffer.from(prefixBytes).toString("hex").toUpperCase();
+  const prefixLen = prefixHex.length; // 2, 4, or 6 hex chars
+  const matches = [];
+  for (const c of contacts) {
+    if (!c.publicKey) continue;
+    const contactHex = Buffer.from(c.publicKey).toString("hex").slice(0, prefixLen).toUpperCase();
+    if (contactHex === prefixHex && c.advName) matches.push(c.advName);
+  }
+  if (matches.length === 1) return `[${prefixHex}] ${matches[0]}`;
+  if (matches.length > 1) return `[${prefixHex}] ?`;
+  return `[${prefixHex}]`;
+}
+
+connection.on(Constants.PushCodes.LogRxData, (data) => {
+  try {
+    const raw = data.raw;
+    if (!raw || raw.length < 2) return;
+
+    const pathByte = raw[1];
+    const hopCount = pathByte & 0x3F;
+    const hashMode = (pathByte >> 6) & 0x03;
+    // Hash mode: 0 = 1-byte prefixes, 1 = 2-byte, 2 = 3-byte
+    const prefixSize = hashMode + 1;
+
+    // Extract prefixes based on hash mode
+    const prefixes = [];
+    for (let i = 0; i < hopCount && (2 + (i + 1) * prefixSize) <= raw.length; i++) {
+      const offset = 2 + i * prefixSize;
+      prefixes.push(raw.slice(offset, offset + prefixSize));
+    }
+
+    const frame = {
+      timestamp: Date.now(),
+      hopCount,
+      hashMode,
+      prefixSize,
+      prefixes,
+      snr: data.lastSnr,
+      rssi: data.lastRssi,
+    };
+
+    rxFrameBuffer.push(frame);
+
+    // Prune old/excess frames
+    const cutoff = Date.now() - RX_FRAME_MAX_AGE_MS;
+    while (rxFrameBuffer.length > 0 && (rxFrameBuffer[0].timestamp < cutoff || rxFrameBuffer.length > RX_FRAME_MAX_BUFFER)) {
+      rxFrameBuffer.shift();
+    }
+
+    if (config.DEBUG) {
+      const prefixHexes = prefixes.map(p => Buffer.from(p).toString("hex").toUpperCase());
+      console.debug(`[debug] RX frame: pathByte=0x${raw[1].toString(16)} hashMode=${hashMode} ${hopCount} hops, prefixes=[${prefixHexes.join(", ")}], snr=${data.lastSnr}, rssi=${data.lastRssi}`);
+    }
+  } catch (e) {
+    console.error("RX frame parse error:", e);
+  }
+});
+
+function findMatchingRxFrame(channelMessage) {
+  const pathByte = channelMessage.pathLen;
+  const msgHopCount = pathByte & 0x3F;
+  const msgHashMode = (pathByte >> 6) & 0x03;
+
+  // Find the most recent frame matching hop count and hash mode
+  for (let i = rxFrameBuffer.length - 1; i >= 0; i--) {
+    const frame = rxFrameBuffer[i];
+    if (frame.hopCount === msgHopCount && frame.hashMode === msgHashMode) {
+      // Remove it so it's not matched again
+      rxFrameBuffer.splice(i, 1);
+      return frame;
+    }
+  }
+  return null;
+}
+
+async function buildPathString(channelMessage) {
+  const hopCount = channelMessage.pathLen & 0x3F;
+
+  if (channelMessage.pathLen === 0xFF || hopCount === 0) {
+    return "-# Direct";
+  }
+
+  const frame = findMatchingRxFrame(channelMessage);
+  if (!frame || frame.prefixes.length === 0) {
+    return `-# ${hopCount} hop${hopCount !== 1 ? "s" : ""}`;
+  }
+
+  const contacts = await getContactsCached();
+  const names = frame.prefixes.map(p => resolvePrefix(contacts, p));
+
+  return `-# ${hopCount} hop${hopCount !== 1 ? "s" : ""}: ${names.join(" → ")}`;
+}
+
 connection.on(Constants.PushCodes.MsgWaiting, async () => {
   try {
     const waitingMessages = await connection.getWaitingMessages();
@@ -1218,15 +1335,18 @@ async function onMeshChannelMessageReceived(channelMessage) {
       }
     }
 
+    // Build packet path string
+    const pathStr = await buildPathString(channelMessage);
+
     // Send via webhook so the sender name appears as the message author
     let sentMsg;
     const webhook = await getOrCreateWebhook(dest);
     if (webhook) {
       const avatarURL = `https://api.dicebear.com/9.x/identicon/png?seed=${encodeURIComponent(senderName)}&size=128`;
-      sentMsg = await webhook.send({ content: `${channelTag}${meshBody}`, username: senderName, avatarURL });
+      sentMsg = await webhook.send({ content: `${channelTag}${meshBody}\n${pathStr}`, username: senderName, avatarURL });
     } else {
       // Fallback to bot message if webhook fails
-      sentMsg = await dest.send(`${channelTag}**${senderName}:** ${meshBody}`);
+      sentMsg = await dest.send(`${channelTag}**${senderName}:** ${meshBody}\n${pathStr}`);
     }
 
     // Track message for reaction matching
