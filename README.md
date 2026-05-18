@@ -100,6 +100,7 @@ node main.js
 
 ### Mesh to Discord
 - **Webhook-based display** -- Mesh users appear with their own username and unique auto-generated avatar in Discord
+- **Packet path display** -- Each message shows the repeater path it took in small text below the message (e.g. `2 hops: [ACE1] Westmere X2 → [C4] ESP | W`). Supports 1, 2, and 3-byte hash modes with automatic repeater name resolution from the contacts list
 - **Reaction mirroring** -- Emoji reactions from MeshCoreOne are applied as native Discord reactions on the correct message (hash-compatible with MeshCoreOne's Crockford Base32 algorithm)
 - **Bridge prefix stripping** -- Configurable list of other bridge node names to strip (e.g. `txtMesh`)
 - **Message deduplication** -- Duplicate messages from multiple bridges are detected and dropped (30-second window)
@@ -128,6 +129,13 @@ node main.js
 - **Channel visibility** -- Subscribed channels are visible only to users with the corresponding role
 - **Public channels** -- Public and emergency channels remain visible to everyone
 
+### User Moderation
+- **Admin block** -- `/block <username>` to permanently block a mesh user from Discord forwarding
+- **Community vote-block** -- `/voteblock <username> <reason>` starts a 15-minute community vote. Requires 10% of online members (minimum 3). Admins can veto with a reaction
+- **Escalating bans** -- Vote-blocks escalate: 4 days, 8 days, then permanent
+- **Appeals** -- Blocked users can reply "appeal" on mesh once per day to send a message to Discord
+- **Auto-expiry** -- Vote-blocks expire automatically with notifications to both mesh and Discord
+
 ### Bridge Controls
 - **Auto-reconnect** -- Automatically reconnects if the USB serial connection drops
 - **Live config reload** -- Reload `config.json` without restarting via `/bridge reload`
@@ -147,11 +155,16 @@ Use `/meshhelp` in Discord to see all available commands.
 | `/nodes` | List all known mesh nodes | Everyone |
 | `/repeater <name>` | Show repeater info and stats | Everyone |
 | `/meshhelp` | Show command help | Everyone |
+| `/voteblock <user> <reason>` | Start a community vote to block a mesh user | Everyone |
 | `/bridge status` | Show bridge status | Admin |
 | `/bridge pause` | Pause forwarding | Admin |
 | `/bridge resume` | Resume forwarding | Admin |
 | `/bridge reload` | Reload config.json | Admin |
 | `/subscribe-setup` | Post channel subscription message | Admin |
+| `/subscribe-refresh` | Update subscription message with new channels | Admin |
+| `/block <username>` | Block a mesh user | Admin |
+| `/unblock <username>` | Unblock a mesh user | Admin |
+| `/blocklist` | Show blocked users with expiry info | Admin |
 
 Legacy prefix commands (`!send`, `!advert`) are also supported using the configured `identifier`.
 
