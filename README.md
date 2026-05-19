@@ -136,6 +136,16 @@ node main.js
 - **Appeals** -- Blocked users can reply "appeal" on mesh once per day to send a message to Discord
 - **Auto-expiry** -- Vote-blocks expire automatically with notifications to both mesh and Discord
 
+### Direct Messages
+- **DM forwarding** -- Mesh DMs to the bridge node are forwarded as Discord DMs to a configurable user
+- **DM replies** -- Reply to the forwarded Discord DM to send a response back to the mesh user
+- **Welcome DMs** -- New mesh users get a one-time welcome DM with Discord link and channel suggestions on their first public message
+
+### Scheduled Messages
+- **Flexible scheduling** -- Send recurring messages to mesh channels, Discord channels, or both
+- **Multiple formats** -- `daily HH:MM`, `weekly mon HH:MM`, `every Nh`, `every Nm`
+- **Manage via commands** -- `/schedule add`, `/schedule list`, `/schedule remove`
+
 ### Bridge Controls
 - **Auto-reconnect** -- Automatically reconnects if the USB serial connection drops
 - **Live config reload** -- Reload `config.json` without restarting via `/bridge reload`
@@ -166,6 +176,9 @@ Use `/meshhelp` in Discord to see all available commands.
 | `/block <username>` | Block a mesh user | Admin |
 | `/unblock <username>` | Unblock a mesh user | Admin |
 | `/blocklist` | Show blocked users with expiry info | Admin |
+| `/schedule add <target> <cron> <msg>` | Schedule a recurring message | Admin |
+| `/schedule list` | List scheduled messages | Everyone |
+| `/schedule remove <id>` | Remove a scheduled message | Admin |
 
 Legacy prefix commands (`!send`, `!advert`) are also supported using the configured `identifier`.
 
@@ -220,6 +233,18 @@ Run `node setup.js` for guided configuration. Below is a reference of all config
 | `SUBSCRIBABLE_CHANNELS` | Array of `{ name, emoji, discordChannelId }` objects |
 | `_SUBSCRIBE_ROLE_MAP` | Auto-populated role mapping (do not edit manually) |
 
+### Direct Messages & Welcome
+
+| Key | Description |
+|-----|-------------|
+| `DM_FORWARD_DISCORD_USER_ID` | Discord user ID to receive forwarded mesh DMs (reply to respond) |
+
+### Scheduled Messages
+
+| Key | Description |
+|-----|-------------|
+| `SCHEDULED_MESSAGES` | Auto-managed array of scheduled messages (use `/schedule` commands) |
+
 ### Bridge Configuration
 
 | Key | Description |
@@ -227,6 +252,7 @@ Run `node setup.js` for guided configuration. Below is a reference of all config
 | `BRIDGE_PREFIXES` | Array of other bridge node names to strip from messages |
 | `BRIDGE_ADMIN_ROLE_IDS` | Discord role IDs allowed to use admin commands |
 | `NODE_ANNOUNCE_CHANNEL_ID` | Channel for new node announcements (falls back to default) |
+| `MESH_NODE_NAME` | Your bridge's MeshCore device name (for outgoing reaction targeting) |
 | `DEBUG` | Enable verbose debug logging (`true`/`false`) |
 
 ### Message Handling

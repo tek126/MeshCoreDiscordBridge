@@ -751,6 +751,190 @@ function isSameDay(ts1, ts2) {
     d1.getDate() === d2.getDate();
 }
 
+/** =========================
+ * Welcome DM for new mesh users
+ * ========================= */
+const WELCOME_FILE = './welcomed_users.json';
+let welcomedUsers = new Set();
+
+try {
+  const data = JSON.parse(fs.readFileSync(WELCOME_FILE, 'utf8'));
+  welcomedUsers = new Set(data);
+  console.log(`Loaded ${welcomedUsers.size} welcomed users.`);
+} catch {
+  // No file yet
+}
+
+function saveWelcomedUsers() {
+  try {
+    fs.writeFileSync(WELCOME_FILE, JSON.stringify([...welcomedUsers]));
+  } catch (e) {
+    console.error("Failed to save welcomed users:", e);
+  }
+}
+
+async function sendWelcomeDM(senderName) {
+  if (welcomedUsers.has(senderName.toLowerCase())) return;
+  welcomedUsers.add(senderName.toLowerCase());
+  saveWelcomedUsers();
+
+  try {
+    const contact = await connection.findContactByName(senderName);
+    if (!contact?.publicKey) {
+      if (config.DEBUG) console.debug(`[debug] Welcome: could not find contact for "${senderName}"`);
+      return;
+    }
+
+    await enqueueMeshSend(() =>
+      connection.sendTextMessage(contact.publicKey,
+        "Welcome to Upstate Mesh! Discord: https://discord.gg/FvajRmXEsb — Add #cdmesh for local chat, #testing for tests.")
+    );
+    if (config.DEBUG) console.debug(`[debug] Sent welcome DM to "${senderName}"`);
+  } catch (e) {
+    console.error(`Failed to send welcome DM to "${senderName}":`, e);
+  }
+}
+
+/** =========================
+ * Scheduled messages
+ * ========================= */
+const activeScheduleTimers = new Map(); // id -> timer
+
+function getSchedules() {
+  return config.SCHEDULED_MESSAGES || [];
+}
+
+function parseCronSchedule(cronStr) {
+  // Supports: "daily HH:MM", "weekly DAY HH:MM", "every Nh" / "every Nm"
+  const s = cronStr.trim().toLowerCase();
+
+  const dailyMatch = s.match(/^daily\s+(\d{1,2}):(\d{2})$/);
+  if (dailyMatch) {
+    return { type: "daily", hour: parseInt(dailyMatch[1]), minute: parseInt(dailyMatch[2]) };
+  }
+
+  const weeklyMatch = s.match(/^weekly\s+(mon|tue|wed|thu|fri|sat|sun)\s+(\d{1,2}):(\d{2})$/);
+  if (weeklyMatch) {
+    const days = { sun: 0, mon: 1, tue: 2, wed: 3, thu: 4, fri: 5, sat: 6 };
+    return { type: "weekly", day: days[weeklyMatch[1]], hour: parseInt(weeklyMatch[2]), minute: parseInt(weeklyMatch[3]) };
+  }
+
+  const everyMatch = s.match(/^every\s+(\d+)\s*(h|m)$/);
+  if (everyMatch) {
+    const val = parseInt(everyMatch[1]);
+    const ms = everyMatch[2] === "h" ? val * 3600000 : val * 60000;
+    return { type: "interval", intervalMs: ms };
+  }
+
+  return null;
+}
+
+function msUntilNext(schedule) {
+  const now = new Date();
+
+  if (schedule.type === "daily") {
+    const target = new Date(now);
+    target.setHours(schedule.hour, schedule.minute, 0, 0);
+    if (target <= now) target.setDate(target.getDate() + 1);
+    return target - now;
+  }
+
+  if (schedule.type === "weekly") {
+    const target = new Date(now);
+    target.setHours(schedule.hour, schedule.minute, 0, 0);
+    const currentDay = target.getDay();
+    let daysUntil = schedule.day - currentDay;
+    if (daysUntil < 0 || (daysUntil === 0 && target <= now)) daysUntil += 7;
+    target.setDate(target.getDate() + daysUntil);
+    return target - now;
+  }
+
+  if (schedule.type === "interval") {
+    return schedule.intervalMs;
+  }
+
+  return null;
+}
+
+async function executeSchedule(entry) {
+  try {
+    const target = entry.target || "";
+
+    // Send to mesh channel
+    if (target.startsWith("mesh:") || /^\d+$/.test(target)) {
+      const meshIdx = parseInt(target.replace("mesh:", ""));
+      if (Number.isFinite(meshIdx)) {
+        await sendMeshChunked(meshIdx, entry.message);
+      }
+    }
+    // Send to Discord channel
+    else if (target.startsWith("discord:")) {
+      const channelId = target.replace("discord:", "");
+      const dest = await bot.channels.fetch(channelId);
+      if (dest?.isTextBased()) {
+        await dest.send(entry.message);
+      }
+    }
+    // Send to both mesh and Discord
+    else if (target.startsWith("both:")) {
+      const parts = target.replace("both:", "").split(",");
+      const meshIdx = parseInt(parts[0]);
+      const discordId = parts[1];
+      if (Number.isFinite(meshIdx)) {
+        await sendMeshChunked(meshIdx, entry.message);
+      }
+      if (discordId) {
+        const dest = await bot.channels.fetch(discordId);
+        if (dest?.isTextBased()) {
+          await dest.send(entry.message);
+        }
+      }
+    }
+
+    if (config.DEBUG) console.debug(`[debug] Executed schedule "${entry.id}": "${entry.message.slice(0, 50)}"`);
+  } catch (e) {
+    console.error(`Schedule execution error for "${entry.id}":`, e);
+  }
+}
+
+function startSchedule(entry) {
+  const parsed = parseCronSchedule(entry.cron);
+  if (!parsed) {
+    console.error(`Invalid schedule "${entry.id}": "${entry.cron}"`);
+    return;
+  }
+
+  function scheduleNext() {
+    const delay = msUntilNext(parsed);
+    if (delay === null) return;
+
+    const timer = setTimeout(async () => {
+      await executeSchedule(entry);
+      scheduleNext();
+    }, delay);
+
+    activeScheduleTimers.set(entry.id, timer);
+  }
+
+  scheduleNext();
+  if (config.DEBUG) console.debug(`[debug] Started schedule "${entry.id}": ${entry.cron}`);
+}
+
+function stopAllSchedules() {
+  for (const timer of activeScheduleTimers.values()) {
+    clearTimeout(timer);
+  }
+  activeScheduleTimers.clear();
+}
+
+function startAllSchedules() {
+  stopAllSchedules();
+  for (const entry of getSchedules()) {
+    startSchedule(entry);
+  }
+  console.log(`Started ${getSchedules().length} scheduled messages.`);
+}
+
 // Make sure we can read message content
 const commands = [
   new SlashCommandBuilder()
@@ -814,6 +998,23 @@ const commands = [
     .setDescription("Show blocked mesh users"),
 
   new SlashCommandBuilder()
+    .setName("schedule")
+    .setDescription("Manage scheduled messages")
+    .addSubcommand(sc =>
+      sc.setName("add").setDescription("Add a scheduled message (admin)")
+        .addStringOption(opt => opt.setName("target").setDescription("Target: mesh channel # (e.g. 0), discord:channelId, or both:meshIdx,discordId").setRequired(true))
+        .addStringOption(opt => opt.setName("cron").setDescription("Schedule: 'daily HH:MM', 'weekly mon HH:MM', 'every Nh'").setRequired(true))
+        .addStringOption(opt => opt.setName("message").setDescription("Message to send").setRequired(true))
+    )
+    .addSubcommand(sc =>
+      sc.setName("list").setDescription("List scheduled messages")
+    )
+    .addSubcommand(sc =>
+      sc.setName("remove").setDescription("Remove a scheduled message (admin)")
+        .addStringOption(opt => opt.setName("id").setDescription("Schedule ID to remove").setRequired(true))
+    ),
+
+  new SlashCommandBuilder()
     .setName("voteblock")
     .setDescription("Start a vote to block a mesh user")
     .addStringOption(opt =>
@@ -871,8 +1072,9 @@ const bot = new Client({
     GatewayIntentBits.GuildMessageReactions,
     GatewayIntentBits.GuildPresences,
     GatewayIntentBits.GuildMembers,
+    GatewayIntentBits.DirectMessages,
   ],
-  partials: [Partials.Message, Partials.Reaction],
+  partials: [Partials.Message, Partials.Reaction, Partials.Channel],
 });
 
 let discordChannel;
@@ -1128,6 +1330,47 @@ async function buildPathString(channelMessage) {
   return `-# ${hopCount} hop${hopCount !== 1 ? "s" : ""}: ${names.join(" → ")}`;
 }
 
+// ---- Mesh DM forwarding ----
+// Track forwarded DM message IDs -> mesh sender name for replies
+const dmSenderMap = new Map(); // discordMessageId -> meshSenderName
+
+async function onMeshContactMessageReceived(contactMessage) {
+  const dmForwardUserId = config.DM_FORWARD_DISCORD_USER_ID;
+  if (!dmForwardUserId) return;
+
+  const text = contactMessage?.text ?? "";
+  if (!text) return;
+
+  // Resolve sender name from pubKeyPrefix
+  let senderName = "Unknown";
+  try {
+    const contacts = await getContactsCached();
+    const prefixHex = Buffer.from(contactMessage.pubKeyPrefix).toString("hex");
+    for (const c of contacts) {
+      if (!c.publicKey) continue;
+      const contactHex = Buffer.from(c.publicKey).toString("hex").slice(0, prefixHex.length);
+      if (contactHex === prefixHex) {
+        senderName = c.advName || senderName;
+        break;
+      }
+    }
+  } catch {}
+
+  try {
+    const user = await bot.users.fetch(dmForwardUserId);
+    const sentMsg = await user.send(`**Mesh DM from ${senderName}:** ${text}\n-# Reply to this message to respond.`);
+    dmSenderMap.set(sentMsg.id, senderName);
+    // Keep map from growing unbounded
+    if (dmSenderMap.size > 100) {
+      const oldest = dmSenderMap.keys().next().value;
+      dmSenderMap.delete(oldest);
+    }
+    if (config.DEBUG) console.debug(`[debug] Forwarded mesh DM from "${senderName}" to Discord user ${dmForwardUserId}`);
+  } catch (e) {
+    console.error("Failed to forward mesh DM to Discord:", e);
+  }
+}
+
 connection.on(Constants.PushCodes.MsgWaiting, async () => {
   try {
     const waitingMessages = await connection.getWaitingMessages();
@@ -1135,6 +1378,7 @@ connection.on(Constants.PushCodes.MsgWaiting, async () => {
     for (const msg of waitingMessages) {
       console.log("Received message:", msg);
       if (msg.channelMessage) await onMeshChannelMessageReceived(msg.channelMessage);
+      if (msg.contactMessage) await onMeshContactMessageReceived(msg.contactMessage);
     }
   } catch (e) {
     console.log(e);
@@ -1269,6 +1513,11 @@ async function onMeshChannelMessageReceived(channelMessage) {
 
     if (config.DEBUG) console.debug(`[debug] Blocked message from ${senderToCheck}`);
     return;
+  }
+
+  // Welcome DM for new users on Public channel
+  if (channelIdx === 0 && senderToCheck && !isUserBlocked(senderToCheck)) {
+    sendWelcomeDM(senderToCheck);
   }
 
   // Emergency channel handling
@@ -1433,6 +1682,7 @@ bot.once("ready", async () => {
   console.log('Listening for commands: !advert, !send <message>');
   discordChannel = await bot.channels.fetch(config.DISCORD_CHANNEL_ID);
   startBlockExpiryChecker();
+  startAllSchedules();
 });
 
 async function handleAdvert(reply) {
@@ -1496,6 +1746,9 @@ bot.on("interactionCreate", async (interaction) => {
         "`/unblock <username>` — Unblock a mesh user (admin)",
         "`/blocklist` — Show blocked mesh users",
         "`/voteblock <username> <reason>` — Start a community vote to block a mesh user",
+        "`/schedule add <target> <cron> <message>` — Schedule a message (admin)",
+        "`/schedule list` — List scheduled messages",
+        "`/schedule remove <id>` — Remove a schedule (admin)",
         "",
         "Messages in forwarding channels are automatically relayed to mesh.",
         "Reactions on bridged messages are mirrored to/from mesh.",
@@ -1945,6 +2198,89 @@ bot.on("interactionCreate", async (interaction) => {
       return;
     }
 
+    if (interaction.commandName === "schedule") {
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+      const sub = interaction.options.getSubcommand();
+
+      if (sub === "list") {
+        const schedules = getSchedules();
+        if (schedules.length === 0) {
+          await interaction.editReply("No scheduled messages.");
+        } else {
+          const lines = schedules.map(s =>
+            `- **${s.id}** — target: \`${s.target}\`, schedule: \`${s.cron}\`\n  Message: "${s.message.slice(0, 80)}${s.message.length > 80 ? "..." : ""}"`
+          );
+          await interaction.editReply(`**Scheduled Messages (${schedules.length}):**\n${lines.join("\n")}`);
+        }
+        return;
+      }
+
+      if (!isBridgeAdminMember(interaction.member)) {
+        await interaction.editReply("Not authorized.");
+        return;
+      }
+
+      if (sub === "add") {
+        const target = interaction.options.getString("target");
+        const cron = interaction.options.getString("cron");
+        const message = interaction.options.getString("message");
+
+        // Validate cron
+        const parsed = parseCronSchedule(cron);
+        if (!parsed) {
+          await interaction.editReply("Invalid schedule format. Use: `daily HH:MM`, `weekly mon HH:MM`, or `every Nh`/`every Nm`");
+          return;
+        }
+
+        // Generate ID
+        const id = `sched_${Date.now().toString(36)}`;
+        const entry = { id, target, cron, message };
+
+        if (!config.SCHEDULED_MESSAGES) config.SCHEDULED_MESSAGES = [];
+        config.SCHEDULED_MESSAGES.push(entry);
+        saveConfig();
+
+        // Start the schedule immediately
+        startSchedule(entry);
+
+        let nextMs = msUntilNext(parsed);
+        let nextText = "";
+        if (nextMs) {
+          const nextDate = new Date(Date.now() + nextMs);
+          nextText = ` Next run: <t:${Math.floor(nextDate.getTime() / 1000)}:R>`;
+        }
+
+        await interaction.editReply(`Schedule **${id}** created!${nextText}\nTarget: \`${target}\`, Schedule: \`${cron}\`\nMessage: "${message}"`);
+        return;
+      }
+
+      if (sub === "remove") {
+        const id = interaction.options.getString("id");
+        if (!config.SCHEDULED_MESSAGES) {
+          await interaction.editReply("No scheduled messages.");
+          return;
+        }
+
+        const before = config.SCHEDULED_MESSAGES.length;
+        config.SCHEDULED_MESSAGES = config.SCHEDULED_MESSAGES.filter(s => s.id !== id);
+        if (config.SCHEDULED_MESSAGES.length < before) {
+          saveConfig();
+          // Stop the timer
+          const timer = activeScheduleTimers.get(id);
+          if (timer) {
+            clearTimeout(timer);
+            activeScheduleTimers.delete(id);
+          }
+          await interaction.editReply(`Schedule **${id}** removed.`);
+        } else {
+          await interaction.editReply(`Schedule **${id}** not found.`);
+        }
+        return;
+      }
+
+      return;
+    }
+
     if (interaction.commandName === "voteblock") {
       const username = interaction.options.getString("username");
       const reason = interaction.options.getString("reason");
@@ -2126,9 +2462,37 @@ bot.on("interactionCreate", async (interaction) => {
 
 bot.on("messageCreate", async (message) => {
   try {
-    // ignore bots and DMs
+    // ignore bots
     if (message.author.bot) return;
-    if (!message.guild) return;
+
+    // Handle DM replies to mesh DM forwards
+    if (!message.guild) {
+      const dmForwardUserId = config.DM_FORWARD_DISCORD_USER_ID;
+      if (dmForwardUserId && message.author.id === dmForwardUserId && message.reference?.messageId) {
+        const senderName = dmSenderMap.get(message.reference.messageId);
+        if (senderName) {
+          try {
+            const contact = await connection.findContactByName(senderName);
+            if (contact?.publicKey) {
+              const replyText = message.content.trim();
+              if (replyText) {
+                await enqueueMeshSend(() =>
+                  connection.sendTextMessage(contact.publicKey, replyText)
+                );
+                await message.react("✅");
+                if (config.DEBUG) console.debug(`[debug] Sent DM reply to mesh user "${senderName}"`);
+              }
+            } else {
+              await message.reply(`Could not find mesh contact "${senderName}".`);
+            }
+          } catch (e) {
+            console.error("DM reply error:", e);
+            await message.reply("Failed to send reply to mesh.").catch(() => {});
+          }
+        }
+      }
+      return;
+    }
 
     // Emergency channel reply detection — cancel reminder if someone responds
     const emergencyChannelId = getEmergencyDiscordChannelId();

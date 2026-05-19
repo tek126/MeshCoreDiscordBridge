@@ -5,3 +5,4 @@ node_modules/
 *.save
 message_history.json
 contacts_backup.json
+welcomed_users.json
