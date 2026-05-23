@@ -139,7 +139,7 @@ node main.js
 ### Direct Messages
 - **DM forwarding** -- Mesh DMs to the bridge node are forwarded as Discord DMs to a configurable user
 - **DM replies** -- Reply to the forwarded Discord DM to send a response back to the mesh user
-- **Welcome DMs** -- New mesh users get a one-time welcome DM with Discord link and channel suggestions on their first public message
+- **Welcome DMs** -- New mesh users get a one-time welcome DM with Discord link and channel suggestions when their advert is first received
 
 ### Scheduled Messages
 - **Flexible scheduling** -- Send recurring messages to mesh channels, Discord channels, or both

@@ -773,25 +773,19 @@ function saveWelcomedUsers() {
   }
 }
 
-async function sendWelcomeDM(senderName) {
-  if (welcomedUsers.has(senderName.toLowerCase())) return;
-  welcomedUsers.add(senderName.toLowerCase());
+async function sendWelcomeDM(name, publicKey) {
+  if (welcomedUsers.has(name.toLowerCase())) return;
+  welcomedUsers.add(name.toLowerCase());
   saveWelcomedUsers();
 
   try {
-    const contact = await connection.findContactByName(senderName);
-    if (!contact?.publicKey) {
-      if (config.DEBUG) console.debug(`[debug] Welcome: could not find contact for "${senderName}"`);
-      return;
-    }
-
     await enqueueMeshSend(() =>
-      connection.sendTextMessage(contact.publicKey,
+      connection.sendTextMessage(publicKey,
         "Welcome to Upstate Mesh! Discord: https://discord.gg/FvajRmXEsb — Add #cdmesh for local chat, #testing for tests.")
     );
-    if (config.DEBUG) console.debug(`[debug] Sent welcome DM to "${senderName}"`);
+    if (config.DEBUG) console.debug(`[debug] Sent welcome DM to "${name}"`);
   } catch (e) {
-    console.error(`Failed to send welcome DM to "${senderName}":`, e);
+    console.error(`Failed to send welcome DM to "${name}":`, e);
   }
 }
 
@@ -1130,45 +1124,49 @@ function scheduleReconnect() {
 // ---- Node join announcements ----
 const knownNodes = new Set();
 
-connection.on(Constants.PushCodes.Advert, async (contact) => {
+async function handleNewAdvert(contact) {
   try {
-    const name = contact?.advName;
-    if (!name || knownNodes.has(name)) return;
+    let name = contact?.advName;
+    let type = contact?.type;
+
+    // Advert push (0x80) only has publicKey — look up the contact for name/type
+    if (!name && contact?.publicKey) {
+      try {
+        const found = await connection.findContactByPublicKeyPrefix(contact.publicKey.subarray(0, 6));
+        if (found) {
+          name = found.advName;
+          type = found.type;
+        }
+      } catch {}
+    }
+
+    if (config.DEBUG) console.debug(`[debug] Advert received: name="${name}" type=${type} hasKey=${!!contact?.publicKey}`);
+    if (!name) return;
+
+    // Welcome DM for new Chat nodes
+    if (type === 1 && contact.publicKey) {
+      sendWelcomeDM(name, contact.publicKey);
+    }
+
+    if (knownNodes.has(name)) return;
     knownNodes.add(name);
 
     const typeLabels = { 0: "Unknown", 1: "Chat", 2: "Repeater", 3: "Room" };
-    const type = typeLabels[contact.type] ?? "Unknown";
+    const typeLabel = typeLabels[type] ?? "Unknown";
     const announceChannelId = config.NODE_ANNOUNCE_CHANNEL_ID || config.DISCORD_CHANNEL_ID;
     if (!announceChannelId) return;
 
     const dest = await bot.channels.fetch(announceChannelId);
     if (dest?.isTextBased()) {
-      await dest.send(`New mesh node discovered: **${name}** (${type})`);
+      await dest.send(`New mesh node discovered: **${name}** (${typeLabel})`);
     }
   } catch (e) {
     console.error("Node announce error:", e);
   }
-});
+}
 
-connection.on(Constants.PushCodes.NewAdvert, async (contact) => {
-  try {
-    const name = contact?.advName;
-    if (!name || knownNodes.has(name)) return;
-    knownNodes.add(name);
-
-    const typeLabels = { 0: "Unknown", 1: "Chat", 2: "Repeater", 3: "Room" };
-    const type = typeLabels[contact.type] ?? "Unknown";
-    const announceChannelId = config.NODE_ANNOUNCE_CHANNEL_ID || config.DISCORD_CHANNEL_ID;
-    if (!announceChannelId) return;
-
-    const dest = await bot.channels.fetch(announceChannelId);
-    if (dest?.isTextBased()) {
-      await dest.send(`New mesh node discovered: **${name}** (${type})`);
-    }
-  } catch (e) {
-    console.error("Node announce error:", e);
-  }
-});
+connection.on(Constants.PushCodes.Advert, handleNewAdvert);
+connection.on(Constants.PushCodes.NewAdvert, handleNewAdvert);
 
 // ---- RX frame buffer for packet path decoding ----
 const rxFrameBuffer = []; // { timestamp, hopCount, prefixes, snr, rssi }
@@ -1513,11 +1511,6 @@ async function onMeshChannelMessageReceived(channelMessage) {
 
     if (config.DEBUG) console.debug(`[debug] Blocked message from ${senderToCheck}`);
     return;
-  }
-
-  // Welcome DM for new users on Public channel
-  if (channelIdx === 0 && senderToCheck && !isUserBlocked(senderToCheck)) {
-    sendWelcomeDM(senderToCheck);
   }
 
   // Emergency channel handling
