@@ -321,6 +321,41 @@ async function shortenUrl(url) {
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
+async function resolveMentions(text, guild) {
+  let result = text;
+
+  // User mentions: <@123456> or <@!123456>
+  const userMentions = result.match(/<@!?(\d+)>/g) || [];
+  for (const mention of userMentions) {
+    const id = mention.match(/\d+/)[0];
+    try {
+      const member = await guild.members.fetch(id);
+      const displayName = member.nickname || member.user.username;
+      result = result.replace(mention, `@${displayName}`);
+    } catch {
+      result = result.replace(mention, "@unknown");
+    }
+  }
+
+  // Role mentions: <@&123456>
+  const roleMentions = result.match(/<@&(\d+)>/g) || [];
+  for (const mention of roleMentions) {
+    const id = mention.match(/\d+/)[0];
+    const role = guild.roles.cache.get(id);
+    result = result.replace(mention, role ? `@${role.name}` : "@unknown-role");
+  }
+
+  // Channel mentions: <#123456>
+  const channelMentions = result.match(/<#(\d+)>/g) || [];
+  for (const mention of channelMentions) {
+    const id = mention.match(/\d+/)[0];
+    const channel = guild.channels.cache.get(id);
+    result = result.replace(mention, channel ? `#${channel.name}` : "#unknown-channel");
+  }
+
+  return result;
+}
+
 function normalizeForMesh(text) {
   return String(text ?? "")
     .replace(/\r\n/g, "\n")
@@ -439,6 +474,52 @@ async function sendMeshChunked(channelIdx, fullText, onSent = null) {
       if (idx !== total2 - 1) {
         await sleep(MESH_CHUNK_DELAY_MS);
       }
+    }
+  });
+}
+
+/**
+ * Chunk + send a DM to a mesh contact with "n/N" suffix and delay between chunks.
+ */
+async function sendDMChunked(publicKey, fullText) {
+  const base = normalizeForMesh(fullText);
+  if (!base) return;
+
+  return enqueueMeshSend(async () => {
+    if (base.length <= MESH_MAXLEN) {
+      if (config.DEBUG) console.debug(`[debug] DM send (single) len=${base.length}: "${base}"`);
+      await connection.sendTextMessage(publicKey, base);
+      return;
+    }
+
+    const suffixReserve = 6;
+    const maxPayload = Math.max(1, MESH_MAXLEN - suffixReserve);
+    let chunks = splitByMaxLen(base, maxPayload);
+
+    const total = chunks.length;
+    const suffixLen = (` ${total}/${total}`).length;
+    const maxPayload2 = Math.max(1, MESH_MAXLEN - suffixLen);
+    if (maxPayload2 !== maxPayload) {
+      chunks = splitByMaxLen(base, maxPayload2);
+    }
+
+    const total2 = chunks.length;
+    if (config.DEBUG) console.debug(`[debug] DM send (chunked) parts=${total2}`);
+
+    for (let idx = 0; idx < total2; idx++) {
+      const partNum = idx + 1;
+      const suffix = ` ${partNum}/${total2}`;
+      let payload = chunks[idx];
+      const allowed = MESH_MAXLEN - suffix.length;
+      if (payload.length > allowed) payload = payload.slice(0, allowed);
+
+      try {
+        await connection.sendTextMessage(publicKey, payload + suffix);
+      } catch (e) {
+        console.error(`DM chunk send failed ${partNum}/${total2}:`, e);
+      }
+
+      if (idx !== total2 - 1) await sleep(MESH_CHUNK_DELAY_MS);
     }
   });
 }
@@ -780,10 +861,7 @@ async function sendWelcomeDM(name, publicKey) {
   saveWelcomedUsers();
 
   try {
-    await enqueueMeshSend(() =>
-      connection.sendTextMessage(publicKey,
-        config.WELCOME_DM_MESSAGE || "Welcome! Send an advert for more info.")
-    );
+    await sendDMChunked(publicKey, config.WELCOME_DM_MESSAGE || "Welcome! Send an advert for more info.");
     if (config.DEBUG) console.debug(`[debug] Sent welcome DM to "${name}"`);
   } catch (e) {
     console.error(`Failed to send welcome DM to "${name}":`, e);
@@ -1614,6 +1692,7 @@ async function onMeshChannelMessageReceived(channelMessage) {
 
     // Strip known bridge prefixes
     let cleaned = stripBridgePrefixes(text);
+    const wasBridgePrefixed = cleaned !== text;
 
     // Deduplication: skip if we've seen this message body recently on this channel
     if (isDuplicate(channelIdx, cleaned)) {
@@ -1621,14 +1700,22 @@ async function onMeshChannelMessageReceived(channelMessage) {
       return;
     }
 
-    const colonIdx = cleaned.indexOf(": ");
     let senderName, meshBody;
-    if (colonIdx > 0 && colonIdx < 30) {
-      senderName = cleaned.slice(0, colonIdx).trim();
-      meshBody = cleaned.slice(colonIdx + 2).trim();
-    } else {
-      senderName = "Mesh";
+    if (wasBridgePrefixed && !cleaned.includes(" [D]: ")) {
+      // Bridge's own message (not a relayed Discord user) — use the bridge name as sender
+      // Extract bridge name from original text
+      const bridgeColonIdx = text.indexOf(": ");
+      senderName = bridgeColonIdx > 0 ? text.slice(0, bridgeColonIdx).trim() : "Mesh";
       meshBody = cleaned;
+    } else {
+      const colonIdx = cleaned.indexOf(": ");
+      if (colonIdx > 0 && colonIdx < 30) {
+        senderName = cleaned.slice(0, colonIdx).trim();
+        meshBody = cleaned.slice(colonIdx + 2).trim();
+      } else {
+        senderName = "Mesh";
+        meshBody = cleaned;
+      }
     }
 
     // Flag unmapped channels so it's clear the message came from an unexpected source
@@ -2416,7 +2503,8 @@ bot.on("interactionCreate", async (interaction) => {
     }
 
     if (interaction.commandName === "send") {
-      const text = interaction.options.getString("message");
+      let text = interaction.options.getString("message");
+      if (interaction.guild) text = await resolveMentions(text, interaction.guild);
       const name =
         interaction.member?.nickname ||
         interaction.user.username;
@@ -2551,7 +2639,8 @@ bot.on("messageCreate", async (message) => {
         attachmentLines.push(`[${ext}, ${sizeStr}] ${short}`);
       }
 
-      const content = (message.content || "").trim();
+      let content = (message.content || "").trim();
+      if (content) content = await resolveMentions(content, message.guild);
       const hasText = content.length > 0;
       const hasAttachments = attachmentLines.length > 0;
 
@@ -2597,7 +2686,8 @@ bot.on("messageCreate", async (message) => {
       // Flood protection gate for prefix send
       if (!(await floodAllowDiscordToMesh(message))) return;
 
-      const text = args.join(" ");
+      let text = args.join(" ");
+      if (message.guild) text = await resolveMentions(text, message.guild);
       const name = message.member?.nickname || message.author.username;
       const meshIdx = getMeshChannelForDiscordChannel(message.channel.id);
       if (meshIdx === null) {
