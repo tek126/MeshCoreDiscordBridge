@@ -225,6 +225,29 @@ async function main() {
   }
 
   // ============================================================
+  // Welcome Messages (Optional)
+  // ============================================================
+  printSection("Welcome Messages (Optional)");
+
+  printHelp("New mesh users can receive a welcome message in two steps:");
+  printHelp("1. A channel message when they first chat on Public");
+  printHelp("2. A DM when their advert is received");
+  printHelp("Use {name} as a placeholder for the username in the channel message.\n");
+
+  config.WELCOME_CHANNEL_MESSAGE = await ask("Channel welcome message", existing.WELCOME_CHANNEL_MESSAGE || "Welcome, {name}! Send an advert for more info.");
+  config.WELCOME_DM_MESSAGE = await ask("Welcome DM message", existing.WELCOME_DM_MESSAGE || "Welcome! Join our Discord and add channels for local chat.");
+
+  // ============================================================
+  // DM Forwarding (Optional)
+  // ============================================================
+  printSection("DM Forwarding (Optional)");
+
+  printHelp("Mesh DMs sent to your bridge node can be forwarded to a Discord user.");
+  printHelp("Right-click a Discord user -> Copy User ID to get their ID.\n");
+
+  config.DM_FORWARD_DISCORD_USER_ID = await ask("Discord user ID to forward DMs to (or Enter to skip)", existing.DM_FORWARD_DISCORD_USER_ID || "");
+
+  // ============================================================
   // Advanced Settings
   // ============================================================
   printSection("Advanced Settings");
@@ -253,6 +276,9 @@ async function main() {
   config.SUBSCRIBABLE_CHANNELS = existing.SUBSCRIBABLE_CHANNELS || [];
   config.BRIDGE_ADMIN_ROLE_IDS = existing.BRIDGE_ADMIN_ROLE_IDS || [];
   config._SUBSCRIBE_ROLE_MAP = existing._SUBSCRIBE_ROLE_MAP || [];
+  config.BLOCKED_MESH_USERS = existing.BLOCKED_MESH_USERS || [];
+  config.SCHEDULED_MESSAGES = existing.SCHEDULED_MESSAGES || [];
+  config.VOTE_BLOCK_HISTORY = existing.VOTE_BLOCK_HISTORY || {};
 
   // ============================================================
   // Save
@@ -269,6 +295,8 @@ async function main() {
   console.log(`  Always-Forward: ${config.DISCORD_ALWAYS_FORWARD_CHANNEL_IDS.length} channels`);
   console.log(`  ImgBB:          ${config.IMGBB_API_KEY ? "configured" : "not set"}`);
   console.log(`  Emergency:      ${config.EMERGENCY_MESH_CHANNEL_IDX != null ? "configured" : "not set"}`);
+  console.log(`  Welcome:        ${config.WELCOME_CHANNEL_MESSAGE ? "configured" : "not set"}`);
+  console.log(`  DM Forward:     ${config.DM_FORWARD_DISCORD_USER_ID ? "configured" : "not set"}`);
   console.log(`  Debug:          ${config.DEBUG}`);
   console.log("");
 
