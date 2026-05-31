@@ -1597,9 +1597,10 @@ async function onMeshChannelMessageReceived(channelMessage) {
       && !welcomedUsers.has(senderToCheck.toLowerCase())
       && !channelWelcomedUsers.has(senderToCheck.toLowerCase())) {
     channelWelcomedUsers.add(senderToCheck.toLowerCase());
-    await enqueueMeshSend(() =>
-      connection.sendChannelTextMessage(0, (config.WELCOME_CHANNEL_MESSAGE || "Welcome, {name}! Send an advert for more info.").replace("{name}", senderToCheck))
-    );
+    await enqueueMeshSend(async () => {
+      await sleep(3000);
+      await connection.sendChannelTextMessage(0, (config.WELCOME_CHANNEL_MESSAGE || "Welcome, {name}! Send an advert for more info.").replace("{name}", senderToCheck));
+    });
     if (config.DEBUG) console.debug(`[debug] Sent channel welcome for "${senderToCheck}"`);
   }
 

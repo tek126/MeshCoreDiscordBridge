@@ -113,6 +113,7 @@ node main.js
 - **Image uploads** -- Images posted in Discord are uploaded to ImgBB and the link is sent to mesh
 - **File attachments** -- Non-image files are sent with file type, size, and a shortened link (e.g. `[PDF, 1.4MB] https://tinyurl.com/...`)
 - **Reaction mirroring** -- Discord emoji reactions on bridged messages are sent to mesh in MeshCoreOne-compatible format with correct hash
+- **Mention translation** -- Discord mentions (`@user`, `@role`, `#channel`) are resolved to readable names before forwarding to mesh
 - **`[D]` tag** -- Discord-origin messages are tagged with `[D]` so mesh users can identify them
 - **Message chunking** -- Long messages are split with `n/N` counters and paced to avoid mesh overload
 - **Flood protection** -- Per-channel rate limiting prevents accidental mesh spam
@@ -139,7 +140,8 @@ node main.js
 ### Direct Messages
 - **DM forwarding** -- Mesh DMs to the bridge node are forwarded as Discord DMs to a configurable user
 - **DM replies** -- Reply to the forwarded Discord DM to send a response back to the mesh user
-- **Welcome DMs** -- New mesh users get a one-time welcome DM with Discord link and channel suggestions when their advert is first received
+- **Welcome messages** -- Two-step welcome for new mesh users: a channel greeting on their first Public message, then a DM with details when their advert arrives. Both messages are configurable
+- **DM chunking** -- Long DMs are automatically split into multiple messages with part numbers
 
 ### Scheduled Messages
 - **Flexible scheduling** -- Send recurring messages to mesh channels, Discord channels, or both
@@ -238,6 +240,8 @@ Run `node setup.js` for guided configuration. Below is a reference of all config
 | Key | Description |
 |-----|-------------|
 | `DM_FORWARD_DISCORD_USER_ID` | Discord user ID to receive forwarded mesh DMs (reply to respond) |
+| `WELCOME_CHANNEL_MESSAGE` | Channel greeting for new users on Public. Use `{name}` for username |
+| `WELCOME_DM_MESSAGE` | DM sent to new users when their advert is received |
 
 ### Scheduled Messages
 
