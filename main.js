@@ -756,6 +756,7 @@ function isSameDay(ts1, ts2) {
  * ========================= */
 const WELCOME_FILE = './welcomed_users.json';
 let welcomedUsers = new Set();
+const channelWelcomedUsers = new Set(); // tracks who got the channel welcome (in-memory only)
 
 try {
   const data = JSON.parse(fs.readFileSync(WELCOME_FILE, 'utf8'));
@@ -781,7 +782,7 @@ async function sendWelcomeDM(name, publicKey) {
   try {
     await enqueueMeshSend(() =>
       connection.sendTextMessage(publicKey,
-        "Welcome to Upstate Mesh! Discord: https://discord.gg/FvajRmXEsb — Add #cdmesh for local chat, #testing for tests.")
+        config.WELCOME_DM_MESSAGE || "Welcome! Send an advert for more info.")
     );
     if (config.DEBUG) console.debug(`[debug] Sent welcome DM to "${name}"`);
   } catch (e) {
@@ -1511,6 +1512,17 @@ async function onMeshChannelMessageReceived(channelMessage) {
 
     if (config.DEBUG) console.debug(`[debug] Blocked message from ${senderToCheck}`);
     return;
+  }
+
+  // Welcome new users on Public channel with a channel message
+  if (channelIdx === 0 && senderToCheck && !isUserBlocked(senderToCheck)
+      && !welcomedUsers.has(senderToCheck.toLowerCase())
+      && !channelWelcomedUsers.has(senderToCheck.toLowerCase())) {
+    channelWelcomedUsers.add(senderToCheck.toLowerCase());
+    await enqueueMeshSend(() =>
+      connection.sendChannelTextMessage(0, (config.WELCOME_CHANNEL_MESSAGE || "Welcome, {name}! Send an advert for more info.").replace("{name}", senderToCheck))
+    );
+    if (config.DEBUG) console.debug(`[debug] Sent channel welcome for "${senderToCheck}"`);
   }
 
   // Emergency channel handling
