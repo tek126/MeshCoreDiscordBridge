@@ -78,5 +78,9 @@
     "ENABLED": true,
     "WORDS": ["fuck"],
     "RESPONSE": "Language!!!"
-  }
+  },
+
+  "WEB_PORT": 3000,
+  "WEB_CLIENT_SECRET": "",
+  "WEB_CALLBACK_URL": "http://localhost:3000/auth/callback"
 }

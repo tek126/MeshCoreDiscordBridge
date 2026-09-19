@@ -157,6 +157,28 @@ node main.js
 - **Contacts backup** -- Repeater/node names are backed up to disk for path resolution even after device resets
 - **Contact pruning** -- Automatic removal of stale contacts from the radio to free slots (configurable threshold and age)
 
+### Web Configuration UI
+- **Browser-based admin dashboard** -- Edit config, view status/metrics, and control the bridge from a web browser
+- **Discord OAuth** -- Only users with admin roles or permissions can access (uses `BRIDGE_ADMIN_ROLE_IDS`)
+- **Live status** -- Auto-refreshing dashboard showing uptime, message counts, mesh connection, error counts
+- **Full config editor** -- Dynamic form with appropriate inputs for each value type (text, number, boolean, arrays, objects)
+- **Bridge controls** -- Pause/resume forwarding and reload config from the browser
+
+#### Web UI Setup
+
+1. In the [Discord Developer Portal](https://discord.com/developers/applications), go to your app's **OAuth2** page
+2. Add a redirect URL: `http://your-host:3000/auth/callback` (adjust host/port)
+3. Copy the **Client Secret**
+4. Add to your `config.json`:
+   ```json
+   {
+     "WEB_PORT": 3000,
+     "WEB_CLIENT_SECRET": "your_client_secret_here",
+     "WEB_CALLBACK_URL": "http://your-host:3000/auth/callback"
+   }
+   ```
+5. Restart the bridge -- the web UI will be available at `http://your-host:3000`
+
 ---
 
 ## Commands
@@ -300,6 +322,14 @@ Run `node setup.js` for guided configuration. Below is a reference of all config
 | Key | Description |
 |-----|-------------|
 | `BLOCKED_MESH_USERS` | Array of blocked users (managed via `/block` and `/voteblock` commands) |
+
+### Web UI
+
+| Key | Description |
+|-----|-------------|
+| `WEB_PORT` | Port for the web configuration UI (web server only starts if set) |
+| `WEB_CLIENT_SECRET` | Discord OAuth2 client secret (Developer Portal > OAuth2) |
+| `WEB_CALLBACK_URL` | OAuth redirect URI (e.g. `http://your-host:3000/auth/callback`) |
 
 ---
 

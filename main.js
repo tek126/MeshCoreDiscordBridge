@@ -16,6 +16,7 @@ import {
   isPocketMeshReact, parseMeshReaction, trackMessage, findHashByDiscordMessageId,
   getMessageHistory, isDuplicate, flushHistory, clearHistorySaveTimer, HISTORY_MAX_AGE_MS,
 } from "./lib/reactions.js";
+import { createWebServer } from "./lib/web/server.js";
 
 process.on("unhandledRejection", (reason, promise) => {
   log.error("Unhandled promise rejection:", reason);
@@ -3026,6 +3027,36 @@ async function shutdown(signal) {
 
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 process.on("SIGINT", () => shutdown("SIGINT"));
+
+// ---- Web UI ----
+const bridgeContext = {
+  getConfig: () => config,
+  getMetrics: () => ({ ...metrics }),
+  getBridgeState: () => ({ ...bridgeState }),
+  isMeshConnected: () => meshConnected,
+  getKnownNodeCount: () => knownNodes.size,
+  setBridgePaused,
+  saveConfig: (newConfig) => {
+    Object.keys(config).forEach(k => { if (!(k in newConfig)) delete config[k]; });
+    Object.assign(config, newConfig);
+    saveConfig();
+    log.setDebug(!!config.DEBUG);
+  },
+  reloadConfig: () => {
+    config = loadConfig();
+    log.setDebug(!!config.DEBUG);
+    webhookCache.clear();
+    startAllSchedules();
+  },
+  adminRoleIds: () => config.BRIDGE_ADMIN_ROLE_IDS || [],
+  guildIds: () => config.GUILD_IDS || (config.GUILD_ID ? [config.GUILD_ID] : []),
+};
+
+if (config.WEB_PORT) {
+  createWebServer(bridgeContext, config).catch(e => {
+    log.error("Web server failed to start:", e.message);
+  });
+}
 
 try {
   await connection.connect();
