@@ -109,8 +109,8 @@ async function main() {
   printHelp("Enter routes as: meshIndex=discordChannelId (one per line).");
   printHelp("Press Enter on an empty line when done.\n");
 
-  config.DISCORD_ROUTES = { ...existing.DISCORD_ROUTES } || {};
-  config.DISCORD_TO_MESH_ROUTES = { ...existing.DISCORD_TO_MESH_ROUTES } || {};
+  config.DISCORD_ROUTES = { ...(existing.DISCORD_ROUTES || {}) };
+  config.DISCORD_TO_MESH_ROUTES = { ...(existing.DISCORD_TO_MESH_ROUTES || {}) };
 
   if (Object.keys(config.DISCORD_ROUTES).length > 0) {
     console.log("  Current routes:");
@@ -234,8 +234,16 @@ async function main() {
   printHelp("2. A DM when their advert is received");
   printHelp("Use {name} as a placeholder for the username in the channel message.\n");
 
-  config.WELCOME_CHANNEL_MESSAGE = await ask("Channel welcome message", existing.WELCOME_CHANNEL_MESSAGE || "Welcome, {name}! Send an advert for more info.");
-  config.WELCOME_DM_MESSAGE = await ask("Welcome DM message", existing.WELCOME_DM_MESSAGE || "Welcome! Join our Discord and add channels for local chat.");
+  const welcomeEnabled = await ask("Enable welcome messages? (yes/no)", (existing.WELCOME_ENABLED !== false) ? "yes" : "no");
+  config.WELCOME_ENABLED = welcomeEnabled.toLowerCase().startsWith("y");
+
+  if (config.WELCOME_ENABLED) {
+    config.WELCOME_CHANNEL_MESSAGE = await ask("Channel welcome message", existing.WELCOME_CHANNEL_MESSAGE || "Welcome, {name}! Send an advert for more info.");
+    config.WELCOME_DM_MESSAGE = await ask("Welcome DM message", existing.WELCOME_DM_MESSAGE || "Welcome! Join our Discord and add channels for local chat.");
+  } else {
+    config.WELCOME_CHANNEL_MESSAGE = existing.WELCOME_CHANNEL_MESSAGE || "";
+    config.WELCOME_DM_MESSAGE = existing.WELCOME_DM_MESSAGE || "";
+  }
 
   // ============================================================
   // DM Forwarding (Optional)

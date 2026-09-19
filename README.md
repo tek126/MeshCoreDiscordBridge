@@ -100,13 +100,13 @@ node main.js
 
 ### Mesh to Discord
 - **Webhook-based display** -- Mesh users appear with their own username and unique auto-generated avatar in Discord
-- **Packet path display** -- Each message shows the repeater path it took in small text below the message (e.g. `2 hops: [ACE1] Westmere X2 → [C4] ESP | W`). Supports 1, 2, and 3-byte hash modes with automatic repeater name resolution from the contacts list and persistent backup
-- **Reaction mirroring** -- Emoji reactions from MeshCoreOne are applied as native Discord reactions on the correct message (hash-compatible with MeshCoreOne's Crockford Base32 algorithm)
+- **Packet path display** -- Each message shows the repeater path it took in small text below the message (e.g. `2 hops: [ACE1] Westmere X2 -> [C4] ESP | W`). Supports 1, 2, and 3-byte hash modes with automatic repeater name resolution from the contacts list and persistent backup
+- **Reaction mirroring** -- Emoji reactions from MeshCoreOne are applied as native Discord reactions on the correct message (hash-compatible with MeshCoreOne's Crockford Base32 algorithm). Supports both old (`emoji@[Name]hash`) and new (`@[Name]emoji\nhash`) formats
 - **Bridge prefix stripping** -- Configurable list of other bridge node names to strip (e.g. `txtMesh`)
 - **Message deduplication** -- Duplicate messages from multiple bridges are detected and dropped (30-second window)
 - **Node join announcements** -- New mesh nodes are announced in Discord when first discovered
 - **Unmapped channel labels** -- Messages from mesh channels without a Discord route are labeled with the channel name
-- **Profanity filter** -- Language warning sent back to mesh
+- **Language filter** -- Configurable word filter with customizable response (see `LANGUAGE_FILTER` config)
 
 ### Discord to Mesh
 - **Always-forward channels** -- Designated Discord channels automatically relay all messages to mesh
@@ -140,7 +140,7 @@ node main.js
 ### Direct Messages
 - **DM forwarding** -- Mesh DMs to the bridge node are forwarded as Discord DMs to a configurable user
 - **DM replies** -- Reply to the forwarded Discord DM to send a response back to the mesh user
-- **Welcome messages** -- Two-step welcome for new mesh users: a channel greeting on their first Public message, then a DM with details when their advert arrives. Both messages are configurable
+- **Welcome messages** -- Two-step welcome for new mesh users: a channel greeting on their first Public message, then a DM with details when their advert arrives. Both messages are configurable and can be enabled/disabled via `WELCOME_ENABLED`
 - **DM chunking** -- Long DMs are automatically split into multiple messages with part numbers
 
 ### Scheduled Messages
@@ -152,8 +152,10 @@ node main.js
 - **Auto-reconnect** -- Automatically reconnects if the USB serial connection drops
 - **Live config reload** -- Reload `config.json` without restarting via `/bridge reload`
 - **Pause/resume** -- Temporarily halt all forwarding in both directions
+- **Graceful shutdown** -- Clean shutdown on SIGTERM/SIGINT saves message history and stops timers
 - **Persistent message history** -- Reaction hash tracking survives restarts (saved to disk, 24-hour expiry)
 - **Contacts backup** -- Repeater/node names are backed up to disk for path resolution even after device resets
+- **Contact pruning** -- Automatic removal of stale contacts from the radio to free slots (configurable threshold and age)
 
 ---
 
@@ -169,7 +171,7 @@ Use `/meshhelp` in Discord to see all available commands.
 | `/repeater <name>` | Show repeater info and stats | Everyone |
 | `/meshhelp` | Show command help | Everyone |
 | `/voteblock <user> <reason>` | Start a community vote to block a mesh user | Everyone |
-| `/bridge status` | Show bridge status | Admin |
+| `/bridge status` | Show bridge status | Everyone |
 | `/bridge pause` | Pause forwarding | Admin |
 | `/bridge resume` | Resume forwarding | Admin |
 | `/bridge reload` | Reload config.json | Admin |
@@ -177,9 +179,10 @@ Use `/meshhelp` in Discord to see all available commands.
 | `/subscribe-refresh` | Update subscription message with new channels | Admin |
 | `/block <username>` | Block a mesh user | Admin |
 | `/unblock <username>` | Unblock a mesh user | Admin |
-| `/blocklist` | Show blocked users with expiry info | Admin |
+| `/blocklist` | Show blocked users with expiry info | Everyone |
+| `/prune` | Remove stale contacts from the radio | Admin |
 | `/schedule add <target> <cron> <msg>` | Schedule a recurring message | Admin |
-| `/schedule list` | List scheduled messages | Everyone |
+| `/schedule list` | List scheduled messages | Admin |
 | `/schedule remove <id>` | Remove a scheduled message | Admin |
 
 Legacy prefix commands (`!send`, `!advert`) are also supported using the configured `identifier`.
@@ -240,6 +243,8 @@ Run `node setup.js` for guided configuration. Below is a reference of all config
 | Key | Description |
 |-----|-------------|
 | `DM_FORWARD_DISCORD_USER_ID` | Discord user ID to receive forwarded mesh DMs (reply to respond) |
+| `WELCOME_ENABLED` | Enable/disable welcome messages (`true`/`false`, default `true`) |
+| `WELCOME_MAX_UNKNOWN_REPEATERS` | Max unknown repeaters in path before skipping welcome DM (default `1`) |
 | `WELCOME_CHANNEL_MESSAGE` | Channel greeting for new users on Public. Use `{name}` for username |
 | `WELCOME_DM_MESSAGE` | DM sent to new users when their advert is received |
 
@@ -256,15 +261,14 @@ Run `node setup.js` for guided configuration. Below is a reference of all config
 | `BRIDGE_PREFIXES` | Array of other bridge node names to strip from messages |
 | `BRIDGE_ADMIN_ROLE_IDS` | Discord role IDs allowed to use admin commands |
 | `NODE_ANNOUNCE_CHANNEL_ID` | Channel for new node announcements (falls back to default) |
-| `MESH_NODE_NAME` | Your bridge's MeshCore device name (for outgoing reaction targeting) |
 | `DEBUG` | Enable verbose debug logging (`true`/`false`) |
 
 ### Message Handling
 
 | Key | Description |
 |-----|-------------|
-| `MESH_MAXLEN` | Max message length for mesh in characters (default `120`) |
-| `MESH_CHUNK_DELAY_MS` | Delay in ms between chunked message parts (default `4000`) |
+| `MESH_MAXLEN` | Max message length for mesh in characters (default `160`) |
+| `MESH_CHUNK_DELAY_MS` | Delay in ms between chunked message parts (default `2500`) |
 
 ### Flood Protection (`FLOOD_PROTECT`)
 
@@ -272,8 +276,30 @@ Run `node setup.js` for guided configuration. Below is a reference of all config
 |-----|-------------|
 | `WINDOW_SECONDS` | Sliding window duration for rate limiting (default `15`) |
 | `MAX_MESSAGES_PER_WINDOW` | Max messages allowed per window before cooldown (default `6`) |
-| `COOLDOWN_SECONDS` | How long to block forwarding after limit is hit (default `300`) |
+| `COOLDOWN_SECONDS` | How long to block forwarding after limit is hit (default `60`) |
 | `WARN_IN_CHANNEL` | Post a warning in Discord when flood protection triggers (`true`/`false`) |
+
+### Language Filter (`LANGUAGE_FILTER`)
+
+| Key | Description |
+|-----|-------------|
+| `ENABLED` | Enable/disable the language filter (default `true` if section present) |
+| `WORDS` | Array of words to filter (case-insensitive) |
+| `RESPONSE` | Message sent back to mesh and Discord when triggered |
+
+### Contact Pruning
+
+| Key | Description |
+|-----|-------------|
+| `CONTACT_PRUNE_INTERVAL_MINUTES` | How often to run auto-prune (default `60`) |
+| `CONTACT_PRUNE_STALE_HOURS` | Remove contacts not seen for this many hours (default `48`) |
+| `CONTACT_PRUNE_THRESHOLD` | Only prune when contact count exceeds this (default `200`) |
+
+### User Moderation
+
+| Key | Description |
+|-----|-------------|
+| `BLOCKED_MESH_USERS` | Array of blocked users (managed via `/block` and `/voteblock` commands) |
 
 ---
 

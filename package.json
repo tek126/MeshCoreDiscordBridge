@@ -2,10 +2,10 @@
   "name": "meshcorediscordbridge",
   "version": "1.0.0",
   "description": "A simple meshcore to Discord bridge. Add your chanel ID into the code and the discord bot token and you should be good to go.",
-  "main": "rx.js",
+  "main": "main.js",
   "type": "module",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "node --test test/"
   },
   "repository": {
     "type": "git",
@@ -19,7 +19,6 @@
   "homepage": "https://github.com/Hude06/MeshCoreDiscordBridge#readme",
   "dependencies": {
     "@liamcottle/meshcore.js": "^1.5.0",
-    "discord.js": "^14.21.0",
-    "dotenv": "^17.2.1"
+    "discord.js": "^14.21.0"
   }
 }
