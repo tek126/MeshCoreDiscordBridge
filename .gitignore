@@ -6,5 +6,6 @@ node_modules/
 message_history.json
 contacts_backup.json
 welcomed_users.json
+known_nodes.json
 core
 core.*

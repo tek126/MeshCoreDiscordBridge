@@ -1112,8 +1112,25 @@ function scheduleReconnect() {
   }, RECONNECT_DELAY_MS);
 }
 
-// ---- Node join announcements ----
-const knownNodes = new Set();
+// ---- Node join announcements (persisted to disk) ----
+const KNOWN_NODES_FILE = './known_nodes.json';
+let knownNodes = new Set();
+
+try {
+  const data = JSON.parse(fs.readFileSync(KNOWN_NODES_FILE, 'utf8'));
+  knownNodes = new Set(data);
+  log.info(`Loaded ${knownNodes.size} known nodes from disk.`);
+} catch {
+  // No file yet
+}
+
+function saveKnownNodes() {
+  try {
+    fs.writeFileSync(KNOWN_NODES_FILE, JSON.stringify([...knownNodes]));
+  } catch (e) {
+    log.error("Failed to save known nodes:", e);
+  }
+}
 
 async function handleNewAdvert(contact) {
   try {
@@ -1154,6 +1171,7 @@ async function handleNewAdvert(contact) {
 
     if (knownNodes.has(name)) return;
     knownNodes.add(name);
+    saveKnownNodes();
 
     const typeLabels = { 0: "Unknown", 1: "Chat", 2: "Repeater", 3: "Room" };
     const typeLabel = typeLabels[type] ?? "Unknown";
