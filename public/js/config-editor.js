@@ -188,7 +188,8 @@ function collectFormValues() {
         const k = row.querySelector(".kv-key")?.value?.trim();
         const v = row.querySelector(".kv-val")?.value?.trim();
         if (k) {
-          obj[k] = /^\d+$/.test(v) ? Number(v) : v;
+          // Keep values as strings — numeric conversion loses precision on Discord snowflake IDs
+          obj[k] = v;
         }
       });
       result[key] = obj;

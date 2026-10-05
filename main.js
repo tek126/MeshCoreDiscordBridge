@@ -1153,6 +1153,21 @@ async function handleNewAdvert(contact) {
     log.debug(`Advert received: name="${name}" type=${type} pathLen=${pathLen} hasKey=${!!contact?.publicKey}`);
     if (!name) return;
 
+    // Directly add to contacts backup so path resolution works even if the
+    // device's contact slots are full and it didn't store this node
+    if (contact.publicKey && name) {
+      const pubKeyHex = Buffer.from(contact.publicKey).toString("hex");
+      const existing = contactsBackup.get(pubKeyHex);
+      if (!existing || existing.name !== name) {
+        contactsBackup.set(pubKeyHex, { name, type: type ?? 0, pubKeyHex });
+        try {
+          fs.writeFileSync(CONTACTS_BACKUP_FILE, JSON.stringify([...contactsBackup.values()]));
+        } catch (e) {
+          log.error("Failed to save contacts backup from advert:", e);
+        }
+      }
+    }
+
     // Welcome DM for new Chat nodes — skip if path has too many unknown repeaters
     if (type === 1 && contact.publicKey) {
       const hops = (pathLen != null && pathLen >= 0 && pathLen !== 0xFF) ? (pathLen & 0x3F) : 0;
