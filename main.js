@@ -89,15 +89,16 @@ let contactsInFlight = null;
   connection.getContacts = () => {
     if (!contactsInFlight) {
       let timer;
-      contactsInFlight = Promise.race([
+      const dump = Promise.race([
         original(),
         new Promise((_, reject) => {
           timer = setTimeout(() => reject(new Error("getContacts timed out")), CONTACTS_TIMEOUT_MS);
         }),
       ]).finally(() => {
         clearTimeout(timer);
-        contactsInFlight = null;
+        if (contactsInFlight === dump) contactsInFlight = null; // a reconnect may have reset it
       });
+      contactsInFlight = dump;
     }
     return contactsInFlight;
   };
@@ -825,13 +826,13 @@ const voteCooldowns = new Map();
 function getVoteBlockCount(username) {
   // Count how many times this user has been vote-blocked before (from config)
   const history = config.VOTE_BLOCK_HISTORY || {};
-  return history[username.toLowerCase()] || 0;
+  return Number(history[username.toLowerCase()]) || 0; // tolerate counts saved as strings
 }
 
 function recordVoteBlock(username) {
   if (!config.VOTE_BLOCK_HISTORY) config.VOTE_BLOCK_HISTORY = {};
   const key = username.toLowerCase();
-  config.VOTE_BLOCK_HISTORY[key] = (config.VOTE_BLOCK_HISTORY[key] || 0) + 1;
+  config.VOTE_BLOCK_HISTORY[key] = getVoteBlockCount(username) + 1;
   saveConfig();
 }
 
@@ -1319,7 +1320,8 @@ connection.on("connected", async () => {
   startHealthCheck();
 
   // The radio only pushes MsgWaiting when a new message arrives, so fetch anything
-  // that queued up while we were disconnected.
+  // that queued up while we were disconnected. At startup Discord may not be ready
+  // yet; the "ready" handler drains then.
   drainMeshMessages();
 });
 
@@ -1365,6 +1367,7 @@ async function connectMesh() {
     if (old.isOpen) old.close(() => {});
   }
   connection.readBuffer = []; // drop any partial frame from the old port
+  contactsInFlight = null;    // a dump on the old port will never finish
 
   clearTimeout(connectVerifyTimer);
   connectVerifyTimer = setTimeout(() => {
@@ -1452,8 +1455,10 @@ async function handleNewAdvert(contact) {
       }
     }
 
-    // (No forced contact refresh here: the backup was updated above, and the cache
-    // refreshes on its own TTL. Two full dumps per advert saturated the serial link.)
+    // Mark the contact cache stale so the next lookup (e.g. a DM from this new node)
+    // refreshes it, without forcing a dump here: two full dumps per advert
+    // saturated the serial link.
+    contactsCacheTime = 0;
 
     if (knownNodes.has(name)) return;
     knownNodes.add(name);
@@ -1636,6 +1641,11 @@ async function getStaleContacts(contacts) {
     now = (await withTimeout(connection.getDeviceTime(), 10_000, "device time")).epochSecs;
   } catch {}
   if (!now) now = Math.max(0, ...contacts.map(c => c.lastMod || 0));
+  // A radio clock that has jumped would make every contact look stale (or none)
+  if (Math.abs(now - Date.now() / 1000) > 24 * 3600) {
+    log.warn(`Radio clock is off by more than a day (${new Date(now * 1000).toISOString()}); skipping prune`);
+    return [];
+  }
   const staleAgeSec = Math.floor(getPruneStaleAgeMs() / 1000);
   return contacts.filter(c => c.publicKey && c.type !== 1 && c.lastMod && (now - c.lastMod) >= staleAgeSec);
 }
@@ -1645,8 +1655,13 @@ async function removeContacts(list) {
   let removed = 0;
   for (const c of list) {
     try {
-      // A local radio command, not a transmission: no pacing or send queue
-      await withTimeout(connection.removeContact(c.publicKey), 10_000, "removeContact");
+      // Not a transmission, but it shares the radio's generic Ok/Err replies with sends,
+      // so run it through the send queue to keep the two from resolving each other.
+      const result = await enqueueMeshSend(
+        () => withTimeout(connection.removeContact(c.publicKey), 10_000, "removeContact"),
+        { force: true },
+      );
+      if (!result.ok) throw result.error;
       removed++;
       log.debug(`Pruned stale contact: "${c.advName}" type=${c.type}`);
     } catch (e) {
@@ -1861,6 +1876,7 @@ async function onMeshContactMessageReceived(contactMessage) {
 let meshSyncRunning = false;
 let meshSyncPending = false;
 async function drainMeshMessages() {
+  if (!bot.isReady()) return; // messages stay queued on the radio; "ready" drains them
   if (meshSyncRunning) {
     meshSyncPending = true;
     return;
@@ -1885,6 +1901,8 @@ async function drainMeshMessages() {
     log.error("Mesh message sync failed:", e);
   } finally {
     meshSyncRunning = false;
+    // A drain requested while this sync was failing (e.g. on reconnect) must still run
+    if (meshSyncPending && meshConnected) setImmediate(drainMeshMessages);
   }
 }
 connection.on(Constants.PushCodes.MsgWaiting, drainMeshMessages);
@@ -2201,6 +2219,7 @@ bot.once("ready", async () => {
   log.info('Listening for commands.');
   startBlockExpiryChecker();
   startAllSchedules();
+  if (meshConnected) drainMeshMessages(); // backlog held until Discord was ready
 
   // Sync channel visibility: subscribable channels are hidden, all others are visible
   try {
@@ -3019,6 +3038,7 @@ bot.on("interactionCreate", async (interaction) => {
         );
       } catch (e) {
         activeVotes.delete(placeholderKey);
+        voteCooldowns.delete(cooldownKey);
         log.error("Failed to post vote message:", e);
         await interaction.editReply("Couldn't post the vote message in this channel.");
         return;
@@ -3420,10 +3440,12 @@ bot.on("messageReactionAdd", async (reaction, user) => {
     if (isBridgePaused()) return;
 
     // Each mirrored reaction is a mesh broadcast, so: skip custom Discord emoji (mesh
-    // clients can't show them) and the bot's own messages (votes, notices), send each
-    // emoji at most once per message, and count it against flood protection.
+    // clients can't show them) and the bot's own untracked messages (votes, notices;
+    // mesh posts that fell back to a bot message are tracked and still mirror), send
+    // each emoji at most once per message, and count it against flood protection.
     if (reaction.emoji.id) return;
-    if (message.author?.id === bot.user.id && !message.webhookId) return;
+    const lookup = findHashByDiscordMessageId(message.id);
+    if (!lookup && message.author?.id === bot.user.id && !message.webhookId) return;
     const emoji = reaction.emoji.name || "?";
     const mirrorKey = `${message.id}:${emoji}`;
     if (mirroredReactions.has(mirrorKey)) return;
@@ -3434,8 +3456,7 @@ bot.on("messageReactionAdd", async (reaction, user) => {
       for (const [k, t] of mirroredReactions) if (t < cutoff) mirroredReactions.delete(k);
     }
 
-    // Look up the original mesh message by Discord message ID
-    const lookup = findHashByDiscordMessageId(message.id);
+    // Mirror against the original mesh message if we know it
     if (lookup) {
       // Extract the target sender name
       // For incoming mesh messages, the target is the mesh sender (before ": ")

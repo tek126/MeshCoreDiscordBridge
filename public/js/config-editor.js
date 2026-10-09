@@ -1,8 +1,12 @@
 import { apiFetch } from "./api.js";
 
 let currentConfig = {};
+let formContainer = null;
+// Form values as rendered; saves send only fields that differ from this.
+let baseline = {};
 
 export async function renderConfigEditor(container) {
+  formContainer = container;
   container.innerHTML = `<div class="config-loading">Loading config...</div>`;
 
   try {
@@ -42,6 +46,7 @@ function renderForm(container) {
 
   document.getElementById("cfg-save").onclick = () => saveConfig(false);
   document.getElementById("cfg-save-reload").onclick = () => saveConfig(true);
+  baseline = collectFormValues();
 }
 
 function renderField(key, value) {
@@ -188,8 +193,11 @@ function collectFormValues() {
         const k = row.querySelector(".kv-key")?.value?.trim();
         const v = row.querySelector(".kv-val")?.value?.trim();
         if (k) {
-          // Keep values as strings — numeric conversion loses precision on Discord snowflake IDs
-          obj[k] = v;
+          // Keep values as strings (numeric conversion loses precision on Discord
+          // snowflake IDs), except where the stored value was already a number, such
+          // as vote-block counts, which must stay numeric.
+          const wasNumber = typeof currentConfig[key]?.[k] === "number";
+          obj[k] = wasNumber && v !== "" && Number.isFinite(Number(v)) ? Number(v) : v;
         }
       });
       result[key] = obj;
@@ -213,12 +221,12 @@ function collectFormValues() {
 async function saveConfig(andReload) {
   const msgEl = document.getElementById("cfg-msg");
   try {
-    // Send only the fields that were edited, so changes the bridge made since this
-    // page loaded (blocks, vote history, subscription IDs) aren't overwritten.
+    // Send only the fields edited since the form was rendered, so changes the bridge
+    // made meanwhile (blocks, vote history, subscription IDs) aren't overwritten.
     const values = collectFormValues();
     const changes = {};
     for (const [key, value] of Object.entries(values)) {
-      if (JSON.stringify(value) !== JSON.stringify(currentConfig[key])) changes[key] = value;
+      if (JSON.stringify(value) !== JSON.stringify(baseline[key])) changes[key] = value;
     }
     if (Object.keys(changes).length === 0 && !andReload) {
       msgEl.textContent = "No changes.";
@@ -239,8 +247,14 @@ async function saveConfig(andReload) {
       msgEl.textContent += " Config reloaded.";
     }
 
+    // Re-render from the saved config so the next save diffs against fresh values
+    const savedMsg = msgEl.textContent, savedClass = msgEl.className;
     currentConfig = await apiFetch("/api/config");
-    setTimeout(() => { msgEl.textContent = ""; }, 5000);
+    renderForm(formContainer);
+    const newMsgEl = document.getElementById("cfg-msg");
+    newMsgEl.textContent = savedMsg;
+    newMsgEl.className = savedClass;
+    setTimeout(() => { newMsgEl.textContent = ""; }, 5000);
   } catch (e) {
     msgEl.textContent = e.message;
     msgEl.className = "config-msg msg-err";
