@@ -6,7 +6,8 @@ import {
   GatewayIntentBits,
   SlashCommandBuilder,
   MessageFlags,
-  Partials
+  Partials,
+  PermissionFlagsBits
 } from "discord.js";
 import fs from "fs";
 import log from "./lib/logger.js";
@@ -25,6 +26,18 @@ process.on("unhandledRejection", (reason, promise) => {
 let config = loadConfig();
 log.setDebug(!!config.DEBUG);
 const connection = new NodeJSSerialConnection(config.SERIAL_PORT || "/dev/ttyUSB0");
+
+// meshcore.js misparses TraceData pushes that use multi-byte path hashes and throws,
+// which floods the error log with "Failed to process frame". The bridge doesn't use
+// trace data, so drop malformed ones quietly.
+const origOnTraceDataPush = connection.onTraceDataPush.bind(connection);
+connection.onTraceDataPush = (bufferReader) => {
+  try {
+    origOnTraceDataPush(bufferReader);
+  } catch (e) {
+    log.debug(`Dropped malformed TraceData push: ${e.message}`);
+  }
+};
 
 // ---- Discord webhook cache for mesh->discord messages ----
 const webhookCache = new Map(); // channelId -> WebhookClient
@@ -1606,7 +1619,14 @@ async function onMeshChannelMessageReceived(channelMessage) {
     try {
       const channel = await bot.channels.fetch(entry.discordChannelId);
       const msg = await channel.messages.fetch(entry.discordMessageId);
-      await msg.react(parsed.emoji);
+      try {
+        await msg.react(parsed.emoji);
+      } catch (e) {
+        // Mesh clients often append U+FE0F to emoji Discord only knows without it (e.g. 👍️, ☕️)
+        const stripped = parsed.emoji.replace(/️/g, "");
+        if (e.code !== 10014 || stripped === parsed.emoji) throw e;
+        await msg.react(stripped);
+      }
       metrics.reactionsApplied++;
       log.debug(`Applied react ${parsed.emoji} to Discord message ${entry.discordMessageId}`);
     } catch (e) {
@@ -1898,6 +1918,36 @@ bot.once("ready", async () => {
   log.info('Listening for commands.');
   startBlockExpiryChecker();
   startAllSchedules();
+
+  // Sync channel visibility: subscribable channels are hidden, all others are visible
+  try {
+    const subscribableIds = new Set((config.SUBSCRIBABLE_CHANNELS || []).map(ch => ch.discordChannelId));
+    const allRoutedIds = new Set(Object.values(config.DISCORD_ROUTES || {}));
+
+    for (const guildId of guildIds) {
+      const guild = await bot.guilds.fetch(guildId).catch(() => null);
+      if (!guild) continue;
+
+      for (const channelId of allRoutedIds) {
+        const channel = await bot.channels.fetch(channelId).catch(() => null);
+        if (!channel || channel.guildId !== guildId) continue;
+
+        if (subscribableIds.has(channelId)) continue;
+
+        // Not subscribable: clear only a ViewChannel deny on @everyone, keep any other overwrites
+        const everyone = channel.permissionOverwrites?.cache.get(guild.id);
+        if (!everyone?.deny.has(PermissionFlagsBits.ViewChannel)) continue;
+        try {
+          await channel.permissionOverwrites.edit(guild.id, { ViewChannel: null });
+          log.info(`Made #${channel.name} visible to @everyone (not a subscribable channel)`);
+        } catch (e) {
+          log.error(`Failed to update visibility for #${channel.name}:`, e);
+        }
+      }
+    }
+  } catch (e) {
+    log.error("Channel visibility sync error:", e);
+  }
 });
 
 async function handleAdvert(reply) {
