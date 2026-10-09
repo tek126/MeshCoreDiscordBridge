@@ -79,6 +79,38 @@ for (const method of ["sendChannelTextMessage", "sendTextMessage", "sendFloodAdv
   };
 }
 
+// Concurrent getContacts() calls share the library's Contact/EndOfContacts listeners,
+// so a call that starts mid-dump gets only the tail of the list, and none of them time
+// out. Share one in-flight dump between all callers.
+const CONTACTS_TIMEOUT_MS = 30_000;
+let contactsInFlight = null;
+{
+  const original = connection.getContacts.bind(connection);
+  connection.getContacts = () => {
+    if (!contactsInFlight) {
+      let timer;
+      contactsInFlight = Promise.race([
+        original(),
+        new Promise((_, reject) => {
+          timer = setTimeout(() => reject(new Error("getContacts timed out")), CONTACTS_TIMEOUT_MS);
+        }),
+      ]).finally(() => {
+        clearTimeout(timer);
+        contactsInFlight = null;
+      });
+    }
+    return contactsInFlight;
+  };
+}
+
+function withTimeout(promise, ms, what) {
+  let timer;
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`${what} timed out`)), ms); }),
+  ]).finally(() => clearTimeout(timer));
+}
+
 // ---- Discord webhook cache for mesh->discord messages ----
 // Caches the lookup promise, so concurrent messages for a new channel share one
 // fetch/create instead of each creating a webhook.
@@ -1211,10 +1243,8 @@ function startHealthCheck() {
   healthCheckTimer = setInterval(async () => {
     if (!meshConnected) return;
     try {
-      const result = await Promise.race([
-        connection.getContacts(),
-        new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), HEALTH_CHECK_TIMEOUT_MS)),
-      ]);
+      // A cheap round trip; a full contact dump every minute saturated the serial link
+      await withTimeout(connection.getBatteryVoltage(), HEALTH_CHECK_TIMEOUT_MS, "battery query");
       healthCheckFailures = 0;
     } catch (e) {
       healthCheckFailures++;
@@ -1272,6 +1302,10 @@ connection.on("connected", async () => {
 
   startContactPruning();
   startHealthCheck();
+
+  // The radio only pushes MsgWaiting when a new message arrives, so fetch anything
+  // that queued up while we were disconnected.
+  drainMeshMessages();
 });
 
 connection.on("disconnected", async () => {
@@ -1349,6 +1383,8 @@ function saveKnownNodes() {
 }
 
 async function handleNewAdvert(contact) {
+  // Grab the advert's RX frame before any await lets newer frames arrive
+  const advertFrame = latestRxFrameOfType(PAYLOAD_TYPE_ADVERT);
   try {
     let name = contact?.advName;
     let type = contact?.type;
@@ -1357,7 +1393,10 @@ async function handleNewAdvert(contact) {
     let pathLen = contact?.outPathLen;
     if (!name && contact?.publicKey) {
       try {
-        const found = await connection.findContactByPublicKeyPrefix(contact.publicKey.subarray(0, 6));
+        // Check the cached contact list first; only new nodes need a fresh dump
+        const keyHex = Buffer.from(contact.publicKey).toString("hex");
+        const found = contactsCache.find(c => c.publicKey && Buffer.from(c.publicKey).toString("hex") === keyHex)
+          || await connection.findContactByPublicKeyPrefix(contact.publicKey.subarray(0, 6));
         if (found) {
           name = found.advName;
           type = found.type;
@@ -1386,19 +1425,20 @@ async function handleNewAdvert(contact) {
 
     // Welcome DM for new Chat nodes — skip if path has too many unknown repeaters
     if (type === 1 && contact.publicKey) {
-      const hops = (pathLen != null && pathLen >= 0 && pathLen !== 0xFF) ? (pathLen & 0x3F) : 0;
+      // Hops from the advert as received; the contact's stored out-path is usually
+      // unknown for a brand-new node, which made this check never run.
+      const hops = advertFrame?.hopCount ?? 0;
       const maxUnknownRepeaters = Number(config.WELCOME_MAX_UNKNOWN_REPEATERS ?? 1);
 
-      if (hops > 0 && hasUnknownPath(maxUnknownRepeaters)) {
+      if (hops > 0 && hasUnknownPath(maxUnknownRepeaters, advertFrame)) {
         log.debug(`Skipping welcome DM for "${name}" — path has too many unknown repeaters (max ${maxUnknownRepeaters})`);
       } else {
         sendWelcomeDM(name, contact.publicKey);
       }
     }
 
-    // Invalidate contacts cache so new contact gets backed up
-    contactsCacheTime = 0;
-    getContactsCached().catch(() => {});
+    // (No forced contact refresh here: the backup was updated above, and the cache
+    // refreshes on its own TTL. Two full dumps per advert saturated the serial link.)
 
     if (knownNodes.has(name)) return;
     knownNodes.add(name);
@@ -1452,16 +1492,14 @@ function resolveAllMatches(prefixHex) {
 }
 
 /**
- * Check the most recent RX frame for path plausibility.
+ * Check an RX frame (the one that carried the message or advert) for path plausibility.
  * Returns true (= skip welcome) if the path doesn't look local:
  *  - Too many prefixes with no known match at all
  *  - Intermediate hops that only match non-repeater nodes (type != 2)
  *  - Hop distances that aren't in increasing order (closer repeaters should come first)
  */
-function hasUnknownPath(maxUnknown) {
-  if (rxFrameBuffer.length === 0) return false;
-  const frame = rxFrameBuffer[rxFrameBuffer.length - 1];
-  if (!frame.prefixes || frame.prefixes.length === 0) return false;
+function hasUnknownPath(maxUnknown, frame) {
+  if (!frame?.prefixes || frame.prefixes.length === 0) return false;
 
   let unknownCount = 0;
   let badHopOrder = 0;
@@ -1574,6 +1612,35 @@ function getPruneMaxContacts() { return Number(config.CONTACT_PRUNE_THRESHOLD ??
 
 let pruneTimer = null;
 
+// Contacts eligible for pruning: not Chat nodes, and not heard for the stale period.
+// Age is by lastMod (when our radio last heard the node, on the radio's clock);
+// lastAdvert is the node's own clock, often unset or wrong on repeaters.
+async function getStaleContacts(contacts) {
+  let now;
+  try {
+    now = (await withTimeout(connection.getDeviceTime(), 10_000, "device time")).epochSecs;
+  } catch {}
+  if (!now) now = Math.max(0, ...contacts.map(c => c.lastMod || 0));
+  const staleAgeSec = Math.floor(getPruneStaleAgeMs() / 1000);
+  return contacts.filter(c => c.publicKey && c.type !== 1 && c.lastMod && (now - c.lastMod) >= staleAgeSec);
+}
+
+// Remove contacts from the radio; returns how many removals actually succeeded.
+async function removeContacts(list) {
+  let removed = 0;
+  for (const c of list) {
+    try {
+      // A local radio command, not a transmission: no pacing or send queue
+      await withTimeout(connection.removeContact(c.publicKey), 10_000, "removeContact");
+      removed++;
+      log.debug(`Pruned stale contact: "${c.advName}" type=${c.type}`);
+    } catch (e) {
+      log.error(`Failed to prune contact "${c.advName}":`, e?.message ?? e);
+    }
+  }
+  return removed;
+}
+
 async function pruneStaleContacts() {
   if (!meshConnected) return;
   try {
@@ -1586,29 +1653,8 @@ async function pruneStaleContacts() {
     // Save all contacts to backup before pruning
     saveContactsBackup(contacts);
 
-    const now = Math.floor(Date.now() / 1000); // lastAdvert is epoch seconds
-    const staleAgeSec = Math.floor(getPruneStaleAgeMs() / 1000);
-    let pruned = 0;
-
-    for (const c of contacts) {
-      // Never prune contacts without a public key
-      if (!c.publicKey) continue;
-      // Never prune Chat nodes (type 1) — only prune Repeaters (2), Rooms (3), Unknown (0)
-      if (c.type === 1) continue;
-      // Skip contacts with no lastAdvert (keep them — we can't tell their age)
-      if (!c.lastAdvert || c.lastAdvert === 0) continue;
-      // Skip if seen recently
-      const age = now - c.lastAdvert;
-      if (age < staleAgeSec) continue;
-
-      try {
-        await enqueueMeshSend(() => connection.removeContact(c.publicKey));
-        pruned++;
-        log.debug(`Pruned stale contact: "${c.advName}" type=${c.type} age=${Math.round(age / 3600)}h`);
-      } catch (e) {
-        log.error(`Failed to prune contact "${c.advName}":`, e);
-      }
-    }
+    const stale = await getStaleContacts(contacts);
+    const pruned = await removeContacts(stale);
 
     if (pruned > 0) {
       log.info(`Contact prune: removed ${pruned} stale contacts (were ${contacts.length}, now ~${contacts.length - pruned})`);
@@ -1659,21 +1705,31 @@ connection.on(Constants.PushCodes.LogRxData, (data) => {
     const raw = data.raw;
     if (!raw || raw.length < 2) return;
 
-    const pathByte = raw[1];
+    // Header: bits 0-1 route type, bits 2-5 payload type. Transport-flood (0) and
+    // transport-direct (3) routes carry 4 bytes of transport codes before the path.
+    const routeType = raw[0] & 0x03;
+    const payloadType = (raw[0] >> 2) & 0x0F;
+    const pathOffset = (routeType === 0 || routeType === 3) ? 5 : 1;
+    if (raw.length <= pathOffset) return;
+
+    const pathByte = raw[pathOffset];
     const hopCount = pathByte & 0x3F;
     const hashMode = (pathByte >> 6) & 0x03;
+    if (hashMode === 3) return; // reserved
     // Hash mode: 0 = 1-byte prefixes, 1 = 2-byte, 2 = 3-byte
     const prefixSize = hashMode + 1;
 
     // Extract prefixes based on hash mode
     const prefixes = [];
-    for (let i = 0; i < hopCount && (2 + (i + 1) * prefixSize) <= raw.length; i++) {
-      const offset = 2 + i * prefixSize;
+    const pathStart = pathOffset + 1;
+    for (let i = 0; i < hopCount && (pathStart + (i + 1) * prefixSize) <= raw.length; i++) {
+      const offset = pathStart + i * prefixSize;
       prefixes.push(raw.slice(offset, offset + prefixSize));
     }
 
     const frame = {
       timestamp: Date.now(),
+      payloadType,
       hopCount,
       hashMode,
       prefixSize,
@@ -1691,25 +1747,34 @@ connection.on(Constants.PushCodes.LogRxData, (data) => {
     }
 
     const prefixHexes = prefixes.map(p => Buffer.from(p).toString("hex").toUpperCase());
-    log.debug(`RX frame: pathByte=0x${raw[1].toString(16)} hashMode=${hashMode} ${hopCount} hops, prefixes=[${prefixHexes.join(", ")}], snr=${data.lastSnr}, rssi=${data.lastRssi}`);
+    log.debug(`RX frame: type=${payloadType} pathByte=0x${pathByte.toString(16)} hashMode=${hashMode} ${hopCount} hops, prefixes=[${prefixHexes.join(", ")}], snr=${data.lastSnr}, rssi=${data.lastRssi}`);
   } catch (e) {
     log.error("RX frame parse error:", e);
   }
 });
 
-function findMatchingRxFrame(channelMessage) {
+const PAYLOAD_TYPE_ADVERT = 0x04;
+const PAYLOAD_TYPE_GRP_TXT = 0x05;
+
+function findMatchingRxFrame(channelMessage, { consume = true } = {}) {
   const pathByte = channelMessage.pathLen;
   const msgHopCount = pathByte & 0x3F;
   const msgHashMode = (pathByte >> 6) & 0x03;
 
-  // Find the most recent frame matching hop count and hash mode
+  // Find the most recent channel-text frame matching hop count and hash mode
   for (let i = rxFrameBuffer.length - 1; i >= 0; i--) {
     const frame = rxFrameBuffer[i];
-    if (frame.hopCount === msgHopCount && frame.hashMode === msgHashMode) {
-      // Remove it so it's not matched again
-      rxFrameBuffer.splice(i, 1);
+    if (frame.payloadType === PAYLOAD_TYPE_GRP_TXT && frame.hopCount === msgHopCount && frame.hashMode === msgHashMode) {
+      if (consume) rxFrameBuffer.splice(i, 1); // so it's not matched again
       return frame;
     }
+  }
+  return null;
+}
+
+function latestRxFrameOfType(payloadType) {
+  for (let i = rxFrameBuffer.length - 1; i >= 0; i--) {
+    if (rxFrameBuffer[i].payloadType === payloadType) return rxFrameBuffer[i];
   }
   return null;
 }
@@ -1773,19 +1838,39 @@ async function onMeshContactMessageReceived(contactMessage) {
   }
 }
 
-connection.on(Constants.PushCodes.MsgWaiting, async () => {
-  try {
-    const waitingMessages = await connection.getWaitingMessages();
-    log.info(`You have ${waitingMessages.length} waiting messages.`);
-    for (const msg of waitingMessages) {
-      log.info("Received message:", msg);
-      if (msg.channelMessage) await onMeshChannelMessageReceived(msg.channelMessage);
-      if (msg.contactMessage) await onMeshContactMessageReceived(msg.contactMessage);
-    }
-  } catch (e) {
-    log.info(e);
+// The radio pushes MsgWaiting for every queued message. Overlapping syncs share the
+// library's listeners and would each receive (and handle) the same messages, so run one
+// sync at a time and loop again if more arrived meanwhile.
+let meshSyncRunning = false;
+let meshSyncPending = false;
+async function drainMeshMessages() {
+  if (meshSyncRunning) {
+    meshSyncPending = true;
+    return;
   }
-});
+  meshSyncRunning = true;
+  try {
+    do {
+      meshSyncPending = false;
+      const waitingMessages = await withTimeout(connection.getWaitingMessages(), 60_000, "message sync");
+      if (waitingMessages.length) log.info(`You have ${waitingMessages.length} waiting messages.`);
+      for (const msg of waitingMessages) {
+        log.info("Received message:", msg);
+        try {
+          if (msg.channelMessage) await onMeshChannelMessageReceived(msg.channelMessage);
+          if (msg.contactMessage) await onMeshContactMessageReceived(msg.contactMessage);
+        } catch (e) {
+          log.error("Error handling mesh message:", e);
+        }
+      }
+    } while (meshSyncPending);
+  } catch (e) {
+    log.error("Mesh message sync failed:", e);
+  } finally {
+    meshSyncRunning = false;
+  }
+}
+connection.on(Constants.PushCodes.MsgWaiting, drainMeshMessages);
 
 function getMeshChannelForDiscordChannel(discordChannelId) {
   const map = config.DISCORD_TO_MESH_ROUTES || {};
@@ -1996,7 +2081,7 @@ async function onMeshChannelMessageReceived(channelMessage) {
   if (config.WELCOME_ENABLED !== false && channelIdx === 0 && senderToCheck && !isUserBlocked(senderToCheck)
       && !welcomedUsers.has(senderToCheck.toLowerCase())
       && !channelWelcomedUsers.has(senderToCheck.toLowerCase())) {
-    if (msgHopCount > 0 && hasUnknownPath(maxUnknownRepeaters)) {
+    if (msgHopCount > 0 && hasUnknownPath(maxUnknownRepeaters, findMatchingRxFrame(channelMessage, { consume: false }))) {
       log.debug(`Skipping welcome for "${senderToCheck}" — path has too many unknown repeaters (max ${maxUnknownRepeaters})`);
     } else {
       channelWelcomedUsers.add(senderToCheck.toLowerCase());
@@ -2524,22 +2609,12 @@ bot.on("interactionCreate", async (interaction) => {
       try {
         const contacts = await connection.getContacts();
         saveContactsBackup(contacts);
-        const now = Math.floor(Date.now() / 1000);
-        const staleAgeSec = Math.floor(getPruneStaleAgeMs() / 1000);
-        const stale = contacts.filter(c =>
-          c.publicKey && c.type !== 1 && c.lastAdvert && c.lastAdvert !== 0 && (now - c.lastAdvert) >= staleAgeSec
-        );
+        const stale = await getStaleContacts(contacts);
         if (stale.length === 0) {
           await interaction.editReply(`No stale contacts to prune (${contacts.length} total, stale threshold: ${getPruneStaleAgeMs() / 3600000}h).`);
           return;
         }
-        let pruned = 0;
-        for (const c of stale) {
-          try {
-            await enqueueMeshSend(() => connection.removeContact(c.publicKey));
-            pruned++;
-          } catch {}
-        }
+        const pruned = await removeContacts(stale);
         contactsCacheTime = 0;
         await interaction.editReply(`Pruned ${pruned} stale contacts (were ${contacts.length}, now ~${contacts.length - pruned}). Backup preserved on server.`);
       } catch (e) {
@@ -3291,7 +3366,7 @@ bot.on("messageReactionAdd", async (reaction, user) => {
       // For outgoing Discord messages, the target is our bridge's mesh node name
       let targetName;
       if (lookup.entry.outgoing) {
-        targetName = config.MESH_NODE_NAME || "Unknown";
+        targetName = meshSelfName || config.MESH_NODE_NAME || "Unknown";
       } else {
         const meshText = lookup.entry.meshText;
         const colonIdx = meshText.indexOf(": ");
