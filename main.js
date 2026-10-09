@@ -1922,6 +1922,7 @@ bot.once("ready", async () => {
   // Sync channel visibility: subscribable channels are hidden, all others are visible
   try {
     const subscribableIds = new Set((config.SUBSCRIBABLE_CHANNELS || []).map(ch => ch.discordChannelId));
+    const skipIds = new Set((config.VISIBILITY_SYNC_SKIP_CHANNEL_IDS || []).map(String));
     const allRoutedIds = new Set(Object.values(config.DISCORD_ROUTES || {}));
 
     for (const guildId of guildIds) {
@@ -1932,7 +1933,7 @@ bot.once("ready", async () => {
         const channel = await bot.channels.fetch(channelId).catch(() => null);
         if (!channel || channel.guildId !== guildId) continue;
 
-        if (subscribableIds.has(channelId)) continue;
+        if (subscribableIds.has(channelId) || skipIds.has(channelId)) continue;
 
         // Not subscribable: clear only a ViewChannel deny on @everyone, keep any other overwrites
         const everyone = channel.permissionOverwrites?.cache.get(guild.id);

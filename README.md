@@ -128,7 +128,7 @@ node main.js
 - **Reaction-based roles** -- Users react to a message to subscribe/unsubscribe from mesh channels
 - **Auto-setup** -- `/subscribe-setup` creates roles, sets channel permissions, and posts the subscription message
 - **Channel visibility** -- Subscribed channels are visible only to users with the corresponding role
-- **Public channels** -- Public and emergency channels remain visible to everyone
+- **Public channels** -- Public and emergency channels remain visible to everyone. On startup, routed channels that are not subscribable are made visible to @everyone, except those listed in `VISIBILITY_SYNC_SKIP_CHANNEL_IDS`
 
 ### User Moderation
 - **Admin block** -- `/block <username>` to permanently block a mesh user from Discord forwarding
@@ -259,6 +259,7 @@ Run `node setup.js` for guided configuration. Below is a reference of all config
 | `SUBSCRIBE_MESSAGE_ID` | Auto-populated after running `/subscribe-setup` |
 | `SUBSCRIBABLE_CHANNELS` | Array of `{ name, emoji, discordChannelId }` objects |
 | `_SUBSCRIBE_ROLE_MAP` | Auto-populated role mapping (do not edit manually) |
+| `VISIBILITY_SYNC_SKIP_CHANNEL_IDS` | Routed channels to leave alone on startup. Otherwise any routed, non-subscribable channel hidden from @everyone is made visible |
 
 ### Direct Messages & Welcome
 
