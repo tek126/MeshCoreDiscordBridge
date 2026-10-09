@@ -213,8 +213,19 @@ function collectFormValues() {
 async function saveConfig(andReload) {
   const msgEl = document.getElementById("cfg-msg");
   try {
+    // Send only the fields that were edited, so changes the bridge made since this
+    // page loaded (blocks, vote history, subscription IDs) aren't overwritten.
     const values = collectFormValues();
-    const resp = await apiFetch("/api/config", { method: "PUT", body: values });
+    const changes = {};
+    for (const [key, value] of Object.entries(values)) {
+      if (JSON.stringify(value) !== JSON.stringify(currentConfig[key])) changes[key] = value;
+    }
+    if (Object.keys(changes).length === 0 && !andReload) {
+      msgEl.textContent = "No changes.";
+      msgEl.className = "config-msg msg-ok";
+      return;
+    }
+    const resp = await apiFetch("/api/config", { method: "PUT", body: changes });
     if (resp.warnings?.length > 0) {
       msgEl.textContent = `Saved with warnings: ${resp.warnings.join(", ")}`;
       msgEl.className = "config-msg msg-warn";

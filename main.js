@@ -564,6 +564,16 @@ const bridgeState = {
   pausedAt: null,
 };
 
+// Pause is saved to disk so a crash or reboot during an incident doesn't quietly
+// resume forwarding.
+const BRIDGE_STATE_FILE = "./bridge_state.json";
+try {
+  Object.assign(bridgeState, JSON.parse(fs.readFileSync(BRIDGE_STATE_FILE, "utf8")));
+  if (bridgeState.paused) log.warn(`Bridge is PAUSED (by ${bridgeState.pausedBy ?? "unknown"} at ${bridgeState.pausedAt}); use /bridge resume`);
+} catch {
+  // No saved state
+}
+
 const metrics = {
   startedAt: Date.now(),
   meshToDiscord: 0,
@@ -583,6 +593,11 @@ function setBridgePaused(paused, actorTag = null) {
   bridgeState.paused = !!paused;
   bridgeState.pausedBy = paused ? actorTag : null;
   bridgeState.pausedAt = paused ? new Date().toISOString() : null;
+  try {
+    fs.writeFileSync(BRIDGE_STATE_FILE, JSON.stringify(bridgeState));
+  } catch (e) {
+    log.error("Failed to save bridge pause state:", e);
+  }
 }
 
 function isBridgeAdminMember(member) {
@@ -1799,7 +1814,7 @@ async function buildPathString(channelMessage) {
 
 // ---- Mesh DM forwarding ----
 // Track forwarded DM message IDs -> mesh sender name for replies
-const dmSenderMap = new Map(); // discordMessageId -> meshSenderName
+const dmSenderMap = new Map(); // discordMessageId -> { name, publicKey }
 
 async function onMeshContactMessageReceived(contactMessage) {
   const dmForwardUserId = config.DM_FORWARD_DISCORD_USER_ID;
@@ -1808,8 +1823,9 @@ async function onMeshContactMessageReceived(contactMessage) {
   const text = contactMessage?.text ?? "";
   if (!text) return;
 
-  // Resolve sender name from pubKeyPrefix
+  // Resolve sender name (and full key, for replies) from pubKeyPrefix
   let senderName = "Unknown";
+  let senderKey = null;
   try {
     const contacts = await getContactsCached();
     const prefixHex = Buffer.from(contactMessage.pubKeyPrefix).toString("hex");
@@ -1818,6 +1834,7 @@ async function onMeshContactMessageReceived(contactMessage) {
       const contactHex = Buffer.from(c.publicKey).toString("hex").slice(0, prefixHex.length);
       if (contactHex === prefixHex) {
         senderName = c.advName || senderName;
+        senderKey = c.publicKey;
         break;
       }
     }
@@ -1826,7 +1843,7 @@ async function onMeshContactMessageReceived(contactMessage) {
   try {
     const user = await bot.users.fetch(dmForwardUserId);
     const sentMsg = await user.send(`**Mesh DM from ${senderName}:** ${text}\n-# Reply to this message to respond.`);
-    dmSenderMap.set(sentMsg.id, senderName);
+    dmSenderMap.set(sentMsg.id, { name: senderName, publicKey: senderKey });
     // Keep map from growing unbounded
     if (dmSenderMap.size > 100) {
       const oldest = dmSenderMap.keys().next().value;
@@ -2294,9 +2311,51 @@ async function handleSend(text, authorName, reply, meshChannelIdx = 0, discordMs
 const REPEATER_COOLDOWN_MS = 60_000;
 const repeaterLastUse = new Map(); // Discord user id -> ms
 
+// Hide a subscribable channel from @everyone and show it to its role. @everyone is
+// denied last, and only once the role has access, so a failure partway can't leave
+// the channel invisible to everyone.
+async function restrictChannelToRole(discordChannel, guild, role, label) {
+  try {
+    // Make sure the bot can still see and post in the channel
+    await discordChannel.permissionOverwrites.edit(bot.user.id, {
+      ViewChannel: true,
+      SendMessages: true,
+      ManageWebhooks: true,
+    });
+  } catch (e) {
+    log.error(`Failed to set bot perms for ${label}:`, e);
+  }
+  try {
+    await discordChannel.permissionOverwrites.edit(role.id, { ViewChannel: true });
+  } catch (e) {
+    log.error(`Failed to set role perms for ${label}; leaving it visible to @everyone:`, e);
+    return false;
+  }
+  try {
+    await discordChannel.permissionOverwrites.edit(guild.id, { ViewChannel: false });
+  } catch (e) {
+    log.error(`Failed to set @everyone perms for ${label}:`, e);
+    return false;
+  }
+  return true;
+}
+
+// Discord rejects messages over 2000 characters; cut long replies (block lists,
+// schedule lists, node lists) instead of failing the whole command.
+function fitDiscord(text) {
+  return text.length <= 2000 ? text : text.slice(0, 1985) + "\n...(truncated)";
+}
+
 bot.on("interactionCreate", async (interaction) => {
   try {
     if (!interaction.isChatInputCommand()) return;
+
+    for (const method of ["reply", "editReply"]) {
+      const original = interaction[method].bind(interaction);
+      interaction[method] = (opts) => original(
+        typeof opts === "string" ? fitDiscord(opts)
+          : (typeof opts?.content === "string" ? { ...opts, content: fitDiscord(opts.content) } : opts));
+    }
 
     if (interaction.commandName === "meshhelp") {
       const help = [
@@ -2345,6 +2404,15 @@ bot.on("interactionCreate", async (interaction) => {
 
       const guild = interaction.guild;
 
+      // Check where the message will go before changing any permissions, so a bad
+      // config can't hide channels with no subscription message to react to.
+      const subscribeChannelId = config.SUBSCRIBE_CHANNEL_ID;
+      const subChannel = subscribeChannelId ? await bot.channels.fetch(subscribeChannelId).catch(() => null) : null;
+      if (!subChannel?.isTextBased()) {
+        await interaction.editReply("SUBSCRIBE_CHANNEL_ID is not set or isn't a text channel the bot can see.");
+        return;
+      }
+
       try {
         // Create roles and set channel permissions for each subscribable channel
         const roleMap = []; // { name, emoji, role, discordChannelId }
@@ -2362,21 +2430,10 @@ bot.on("interactionCreate", async (interaction) => {
 
           // Set channel permissions — hide from @everyone, show for role
           const discordChannel = await bot.channels.fetch(ch.discordChannelId).catch(() => null);
-          if (discordChannel) {
-            await discordChannel.permissionOverwrites.edit(guild.id, {
-              ViewChannel: false,
-            }).catch(e => log.error(`Failed to set @everyone perms for ${ch.name}:`, e));
-
-            await discordChannel.permissionOverwrites.edit(role.id, {
-              ViewChannel: true,
-            }).catch(e => log.error(`Failed to set role perms for ${ch.name}:`, e));
-
-            // Make sure the bot can still see and post in the channel
-            await discordChannel.permissionOverwrites.edit(bot.user.id, {
-              ViewChannel: true,
-              SendMessages: true,
-              ManageWebhooks: true,
-            }).catch(e => log.error(`Failed to set bot perms for ${ch.name}:`, e));
+          if (discordChannel?.guildId === guild.id) {
+            await restrictChannelToRole(discordChannel, guild, role, ch.name);
+          } else if (discordChannel) {
+            log.warn(`Skipping ${ch.name}: it belongs to a different server than this command`);
           }
 
           roleMap.push({ name: ch.name, emoji: ch.emoji, role, discordChannelId: ch.discordChannelId });
@@ -2394,13 +2451,6 @@ bot.on("interactionCreate", async (interaction) => {
         }
         lines.push("", "_Remove your reaction to unsubscribe._");
 
-        const subscribeChannelId = config.SUBSCRIBE_CHANNEL_ID;
-        if (!subscribeChannelId) {
-          await interaction.editReply("SUBSCRIBE_CHANNEL_ID not configured.");
-          return;
-        }
-
-        const subChannel = await bot.channels.fetch(subscribeChannelId);
         const subMsg = await subChannel.send(lines.join("\n"));
 
         // Add reactions in order
@@ -2470,20 +2520,10 @@ bot.on("interactionCreate", async (interaction) => {
 
           // Set channel permissions
           const discordChannel = await bot.channels.fetch(ch.discordChannelId).catch(() => null);
-          if (discordChannel) {
-            await discordChannel.permissionOverwrites.edit(guild.id, {
-              ViewChannel: false,
-            }).catch(e => log.error(`Failed to set @everyone perms for ${ch.name}:`, e));
-
-            await discordChannel.permissionOverwrites.edit(role.id, {
-              ViewChannel: true,
-            }).catch(e => log.error(`Failed to set role perms for ${ch.name}:`, e));
-
-            await discordChannel.permissionOverwrites.edit(bot.user.id, {
-              ViewChannel: true,
-              SendMessages: true,
-              ManageWebhooks: true,
-            }).catch(e => log.error(`Failed to set bot perms for ${ch.name}:`, e));
+          if (discordChannel?.guildId === guild.id) {
+            await restrictChannelToRole(discordChannel, guild, role, ch.name);
+          } else if (discordChannel) {
+            log.warn(`Skipping ${ch.name}: it belongs to a different server than this command`);
           }
 
           roleMap.push({ emoji: ch.emoji, roleId: role.id, name: ch.name });
@@ -2780,11 +2820,15 @@ bot.on("interactionCreate", async (interaction) => {
 
       if (addBlockedUser(username, pubKeyHex)) {
         // Send warning to mesh on public channel
-        await enqueueMeshSend(() =>
-          connection.sendChannelTextMessage(0,
-            `${username}: You have been blocked from Discord. Reply "appeal" once daily to request an unblock.`)
-        );
-        await interaction.editReply(`Blocked **${username}**${pubKeyHex ? ` (key: ${pubKeyHex.slice(0, 12)}...)` : ""}. Their messages will no longer be forwarded to Discord. Warning sent to mesh.`);
+        let warning = "Bridge is paused, so no warning was sent to mesh.";
+        if (!isBridgePaused()) {
+          const result = await enqueueMeshSend(() =>
+            connection.sendChannelTextMessage(0,
+              `${username}: You have been blocked from Discord. Reply "appeal" once daily to request an unblock.`)
+          );
+          warning = result.ok ? "Warning sent to mesh." : "The mesh warning failed to send.";
+        }
+        await interaction.editReply(`Blocked **${username}**${pubKeyHex ? ` (key: ${pubKeyHex.slice(0, 12)}...)` : ""}. Their messages will no longer be forwarded to Discord. ${warning}`);
       } else {
         await interaction.editReply(`**${username}** is already blocked.`);
       }
@@ -2917,12 +2961,14 @@ bot.on("interactionCreate", async (interaction) => {
     }
 
     if (interaction.commandName === "voteblock") {
+      // Defer first: posting the vote and adding three reactions can exceed 3 seconds
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
       const username = interaction.options.getString("username");
       const reason = interaction.options.getString("reason");
 
       // Check if already blocked
       if (isUserBlocked(username)) {
-        await interaction.reply({ content: `**${username}** is already blocked.`, flags: MessageFlags.Ephemeral });
+        await interaction.editReply(`**${username}** is already blocked.`);
         return;
       }
 
@@ -2931,14 +2977,14 @@ bot.on("interactionCreate", async (interaction) => {
       const lastVote = voteCooldowns.get(cooldownKey) || 0;
       if (Date.now() - lastVote < VOTE_COOLDOWN_MS) {
         const remaining = Math.ceil((VOTE_COOLDOWN_MS - (Date.now() - lastVote)) / 60000);
-        await interaction.reply({ content: `A vote for **${username}** was attempted recently. Try again in ${remaining} minutes.`, flags: MessageFlags.Ephemeral });
+        await interaction.editReply(`A vote for **${username}** was attempted recently. Try again in ${remaining} minutes.`);
         return;
       }
 
       // Check if there's already an active vote for this user
       for (const vote of activeVotes.values()) {
         if (vote.username.toLowerCase() === cooldownKey) {
-          await interaction.reply({ content: `A vote for **${username}** is already in progress.`, flags: MessageFlags.Ephemeral });
+          await interaction.editReply(`A vote for **${username}** is already in progress.`);
           return;
         }
       }
@@ -2954,21 +3000,32 @@ bot.on("interactionCreate", async (interaction) => {
       const priorBlocks = getVoteBlockCount(username);
       const escalationNote = priorBlocks > 0 ? ` (prior blocks: ${priorBlocks})` : "";
 
-      // Post vote message
-      const voteMsg = await interaction.channel.send(
-        `**Vote to block \`${username}\` ${durationText}${escalationNote}**\n` +
-        `Reason: ${reason}\n` +
-        `Initiated by: ${interaction.user.username}\n\n` +
-        `React 👍 to vote yes, 👎 to vote no.\n` +
-        `Admins: react ${VOTE_VETO_EMOJI} to veto.\n` +
-        `Needs **${threshold}** yes votes. Closes <t:${Math.floor((Date.now() + VOTE_DURATION_MS) / 1000)}:R>.`
-      );
-
-      await voteMsg.react("👍");
-      await voteMsg.react("👎");
-      await voteMsg.react(VOTE_VETO_EMOJI);
-
+      // Reserve the vote before any await so a simultaneous /voteblock for the same
+      // name sees it, and start the cooldown now.
+      const placeholderKey = `pending:${cooldownKey}`;
+      activeVotes.set(placeholderKey, { username });
       voteCooldowns.set(cooldownKey, Date.now());
+
+      // Post vote message
+      let voteMsg;
+      try {
+        voteMsg = await interaction.channel.send(
+          `**Vote to block \`${username}\` ${durationText}${escalationNote}**\n` +
+          `Reason: ${reason}\n` +
+          `Initiated by: ${interaction.user.username}\n\n` +
+          `React 👍 to vote yes, 👎 to vote no.\n` +
+          `Admins: react ${VOTE_VETO_EMOJI} to veto.\n` +
+          `Needs **${threshold}** yes votes and more yes than no. Closes <t:${Math.floor((Date.now() + VOTE_DURATION_MS) / 1000)}:R>.`
+        );
+      } catch (e) {
+        activeVotes.delete(placeholderKey);
+        log.error("Failed to post vote message:", e);
+        await interaction.editReply("Couldn't post the vote message in this channel.");
+        return;
+      }
+      for (const emoji of ["👍", "👎", VOTE_VETO_EMOJI]) {
+        await voteMsg.react(emoji).catch(e => log.error(`Failed to add ${emoji} to vote message:`, e));
+      }
 
       // Set timer to resolve the vote
       const timer = setTimeout(async () => {
@@ -2993,11 +3050,23 @@ bot.on("interactionCreate", async (interaction) => {
             }
           }
 
-          // Count yes votes (subtract 1 for bot's reaction)
-          const yesReaction = msg.reactions.cache.find(r => r.emoji.name === "👍");
-          const yesCount = yesReaction ? yesReaction.count - 1 : 0;
+          // Count real voters only: no bots, and anyone who voted both ways counts for
+          // neither side. Passes with enough yes votes AND more yes than no.
+          const voters = async (emoji) => {
+            const r = msg.reactions.cache.find(x => x.emoji.name === emoji);
+            if (!r) return new Set();
+            const users = await r.users.fetch();
+            return new Set(users.filter(u => !u.bot).map(u => u.id));
+          };
+          const yesIds = await voters("👍");
+          const noIds = await voters("👎");
+          for (const id of [...yesIds]) {
+            if (noIds.has(id)) { yesIds.delete(id); noIds.delete(id); }
+          }
+          const yesCount = yesIds.size;
+          const noCount = noIds.size;
 
-          if (yesCount >= threshold) {
+          if (yesCount >= threshold && yesCount > noCount) {
             // Vote passed
             const blockDays = getVoteBlockDuration(username);
             const expiresAt = blockDays > 0 ? Date.now() + (blockDays * 24 * 60 * 60 * 1000) : null;
@@ -3012,21 +3081,23 @@ bot.on("interactionCreate", async (interaction) => {
             recordVoteBlock(username);
 
             const durationText = blockDays === 0 ? "permanently" : `for ${blockDays} days`;
-            await msg.reply(`Vote passed (**${yesCount}**/${threshold}). **${username}** has been blocked ${durationText}.`);
+            await msg.reply(`Vote passed (**${yesCount}** yes, ${noCount} no; ${threshold} needed). **${username}** has been blocked ${durationText}.`);
 
             // Warn on mesh
-            await enqueueMeshSend(() =>
+            if (!isBridgePaused()) await enqueueMeshSend(() =>
               connection.sendChannelTextMessage(0,
                 `${username}: You have been vote-blocked ${durationText}. Reply "appeal" once daily to request an unblock.`)
             );
           } else {
-            await msg.reply(`Vote failed (**${yesCount}**/${threshold} needed). **${username}** will not be blocked.`);
+            const why = yesCount < threshold ? `${threshold} yes votes needed` : "not more yes than no";
+            await msg.reply(`Vote failed (**${yesCount}** yes, ${noCount} no; ${why}). **${username}** will not be blocked.`);
           }
         } catch (e) {
           log.error("Vote resolution error:", e);
         }
       }, VOTE_DURATION_MS);
 
+      activeVotes.delete(placeholderKey);
       activeVotes.set(voteMsg.id, {
         username,
         reason,
@@ -3036,7 +3107,7 @@ bot.on("interactionCreate", async (interaction) => {
         initiator: interaction.user.username,
       });
 
-      await interaction.reply({ content: `Vote to block **${username}** started!`, flags: MessageFlags.Ephemeral });
+      await interaction.editReply(`Vote to block **${username}** started!`);
       return;
     }
 
@@ -3105,21 +3176,26 @@ bot.on("messageCreate", async (message) => {
     if (!message.guild) {
       const dmForwardUserId = config.DM_FORWARD_DISCORD_USER_ID;
       if (dmForwardUserId && message.author.id === dmForwardUserId && message.reference?.messageId) {
-        const senderName = dmSenderMap.get(message.reference.messageId);
-        if (senderName) {
+        const sender = dmSenderMap.get(message.reference.messageId);
+        if (sender) {
+          const senderName = sender.name;
           try {
-            const contact = await connection.findContactByName(senderName);
-            if (contact?.publicKey) {
-              const replyText = message.content.trim();
-              if (replyText) {
-                await enqueueMeshSend(() =>
-                  connection.sendTextMessage(contact.publicKey, replyText)
-                );
+            // Use the key captured when the DM arrived; names aren't unique on the mesh
+            const publicKey = sender.publicKey
+              || (await connection.findContactByName(senderName))?.publicKey;
+            const replyText = message.content.trim();
+            if (isBridgePaused()) {
+              await message.reply("Bridge is paused; reply not sent to mesh.");
+            } else if (!publicKey) {
+              await message.reply(`Could not find mesh contact "${senderName}".`);
+            } else if (replyText) {
+              const result = await sendDMChunked(publicKey, replyText);
+              if (result?.ok) {
                 await message.react("✅");
                 log.debug(`Sent DM reply to mesh user "${senderName}"`);
+              } else {
+                await message.reply(`Failed to send reply to mesh: ${result?.error?.message ?? "radio error"}`);
               }
-            } else {
-              await message.reply(`Could not find mesh contact "${senderName}".`);
             }
           } catch (e) {
             log.error("DM reply error:", e);
@@ -3442,10 +3518,19 @@ const bridgeContext = {
   isMeshConnected: () => meshConnected,
   getKnownNodeCount: () => knownNodes.size,
   setBridgePaused,
-  saveConfig: (newConfig) => {
-    Object.keys(config).forEach(k => { if (!(k in newConfig)) delete config[k]; });
-    Object.assign(config, newConfig);
-    saveConfig();
+  // Merge changed keys (the web UI sends only what was edited). Throws if the file
+  // can't be written, so the UI doesn't report a save that didn't happen.
+  saveConfig: (changes) => {
+    const previous = { ...config };
+    Object.assign(config, changes);
+    try {
+      saveConfigAtomic(config);
+    } catch (e) {
+      for (const k of Object.keys(changes)) {
+        if (k in previous) config[k] = previous[k]; else delete config[k];
+      }
+      throw e;
+    }
     log.setDebug(!!config.DEBUG);
   },
   reloadConfig: () => {

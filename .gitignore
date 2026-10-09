@@ -9,3 +9,4 @@ welcomed_users.json
 known_nodes.json
 core
 core.*
+bridge_state.json

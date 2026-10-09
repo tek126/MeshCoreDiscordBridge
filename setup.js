@@ -49,7 +49,9 @@ async function main() {
     console.log("  No existing config.json found — starting fresh.\n");
   }
 
-  const config = {};
+  // Start from the existing config so keys the wizard doesn't ask about (web UI,
+  // language filter, send gap, pruning, ...) survive a re-run.
+  const config = { ...existing };
 
   // ============================================================
   // Discord Bot Setup
@@ -195,7 +197,10 @@ async function main() {
   printHelp("First message pings everyone, auto-replies to mesh, and reminds if no response.\n");
 
   if (await askYesNo("Configure an emergency channel?", existing.EMERGENCY_MESH_CHANNEL_IDX != null ? "y" : "n")) {
-    config.EMERGENCY_MESH_CHANNEL_IDX = Number(await ask("  Emergency mesh channel index", String(existing.EMERGENCY_MESH_CHANNEL_IDX ?? "")));
+    // Empty must not become Number("") = 0, which would make Public the emergency channel
+    const emergencyIdx = (await ask("  Emergency mesh channel index", String(existing.EMERGENCY_MESH_CHANNEL_IDX ?? ""))).trim();
+    config.EMERGENCY_MESH_CHANNEL_IDX = emergencyIdx === "" || isNaN(Number(emergencyIdx)) ? null : Number(emergencyIdx);
+    if (config.EMERGENCY_MESH_CHANNEL_IDX === null) console.log("  No valid index entered; emergency channel left unset.");
     config.EMERGENCY_DISCORD_CHANNEL_ID = await ask("  Emergency Discord channel ID", existing.EMERGENCY_DISCORD_CHANNEL_ID || "");
     config.EMERGENCY_COOLDOWN_MINUTES = Number(await ask("  Cooldown before re-alerting (minutes)", String(existing.EMERGENCY_COOLDOWN_MINUTES ?? 30)));
     config.EMERGENCY_REMINDER_MINUTES = Number(await ask("  Reminder if no reply (minutes)", String(existing.EMERGENCY_REMINDER_MINUTES ?? 5)));
@@ -326,7 +331,8 @@ async function main() {
     }
   }
 
-  fs.writeFileSync("./config.json", JSON.stringify(config, null, 2));
+  fs.writeFileSync("./config.json", JSON.stringify(config, null, 2), { mode: 0o600 }); // holds bot token + secrets
+  fs.chmodSync("./config.json", 0o600); // mode only applies when the file is created
   console.log("\n  config.json saved successfully!");
   console.log("\n  Next steps:");
   console.log("    1. npm install");
