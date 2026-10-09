@@ -202,6 +202,54 @@ async function uploadToImgBB(imageUrl) {
   }
 }
 
+// ---- Self-hosted file upload (e.g. unym.pics), used for images and other files ----
+// The service takes raw bytes with a Bearer token and returns {"url"}. Discord CDN links
+// are signed and expire, so the bridge downloads the attachment and re-uploads it.
+function getFileHostUrl() { return String(config.FILE_HOST_URL || "").replace(/\/+$/, ""); }
+function getFileHostToken() { return config.FILE_HOST_TOKEN || ""; }
+const FILE_HOST_MAX_BYTES = 100 * 1024 * 1024;
+const FILE_HOST_TIMEOUT_MS = 5 * 60 * 1000;
+
+async function uploadToFileHost(att) {
+  if (!getFileHostUrl() || !getFileHostToken()) return null;
+  if (att.size > FILE_HOST_MAX_BYTES) {
+    log.warn(`Attachment ${att.name} is ${att.size} bytes, over the file host limit; not uploading.`);
+    return null;
+  }
+
+  try {
+    const signal = AbortSignal.timeout(FILE_HOST_TIMEOUT_MS);
+    const src = await fetch(att.url, { signal });
+    if (!src.ok || !src.body) {
+      log.error(`Failed to download Discord attachment ${att.name}: ${src.status} ${src.statusText}`);
+      return null;
+    }
+
+    const res = await fetch(`${getFileHostUrl()}/upload`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${getFileHostToken()}`,
+        "Content-Type": att.contentType || "application/octet-stream",
+        "X-Filename": String(att.name || "file").replace(/[^\x20-\x7e]/g, "_"),
+      },
+      body: src.body,
+      duplex: "half",
+      signal,
+    });
+
+    if (!res.ok) {
+      log.error(`File host upload failed for ${att.name}: ${res.status} ${await res.text().catch(() => "")}`);
+      return null;
+    }
+
+    const data = await res.json();
+    return data?.url || null;
+  } catch (e) {
+    log.error(`File host upload error for ${att.name}:`, e);
+    return null;
+  }
+}
+
 // ---- URL shortening via TinyURL (free, no API key) ----
 async function shortenUrl(url) {
   try {
@@ -2870,7 +2918,8 @@ bot.on("messageCreate", async (message) => {
       // Optional: don't forward commands typed in that channel (keeps it cleaner)
       if (config.identifier && message.content.startsWith(config.identifier)) return;
 
-      // Handle attachments: images go to ImgBB, other files get a name + shortened link
+      // Handle attachments: uploaded to the file host if configured, otherwise images go to
+      // ImgBB and other files get a TinyURL to the Discord CDN link
       const allAtts = [...message.attachments.values()];
       const imageAtts = allAtts.filter(isImageAttachment);
       const fileAtts = allAtts.filter(a => !isImageAttachment(a));
@@ -2878,7 +2927,8 @@ bot.on("messageCreate", async (message) => {
       const attachmentLines = [];
 
       for (const att of imageAtts) {
-        const link = await uploadToImgBB(att.url);
+        let link = await uploadToFileHost(att);
+        if (!link && getImgbbApiKey()) link = await uploadToImgBB(att.url);
         if (link) attachmentLines.push(link);
       }
 
@@ -2888,8 +2938,8 @@ bot.on("messageCreate", async (message) => {
           : size < 1048576 ? `${(size / 1024).toFixed(1)}KB`
           : `${(size / 1048576).toFixed(1)}MB`;
         const ext = (att.name?.split('.').pop() || 'file').toUpperCase();
-        const short = await shortenUrl(att.url);
-        attachmentLines.push(`[${ext}, ${sizeStr}] ${short}`);
+        const link = (await uploadToFileHost(att)) || (await shortenUrl(att.url));
+        attachmentLines.push(`[${ext}, ${sizeStr}] ${link}`);
       }
 
       let content = (message.content || "").trim();

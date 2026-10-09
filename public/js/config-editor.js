@@ -54,7 +54,7 @@ function renderField(key, value) {
   } else if (type === "number") {
     input = `<input type="number" id="${id}" value="${value ?? ""}" class="cfg-input">`;
   } else if (type === "string") {
-    const isSecret = ["DISCORD_TOKEN", "WEB_CLIENT_SECRET", "IMGBB_API_KEY"].includes(key);
+    const isSecret = ["DISCORD_TOKEN", "WEB_CLIENT_SECRET", "IMGBB_API_KEY", "FILE_HOST_TOKEN"].includes(key);
     input = `<input type="${isSecret ? "password" : "text"}" id="${id}" value="${escHtml(String(value ?? ""))}" class="cfg-input">`;
   } else if (type === "string-array") {
     input = renderStringArray(id, value);

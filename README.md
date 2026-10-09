@@ -110,8 +110,9 @@ node main.js
 
 ### Discord to Mesh
 - **Always-forward channels** -- Designated Discord channels automatically relay all messages to mesh
-- **Image uploads** -- Images posted in Discord are uploaded to ImgBB and the link is sent to mesh
-- **File attachments** -- Non-image files are sent with file type, size, and a shortened link (e.g. `[PDF, 1.4MB] https://tinyurl.com/...`)
+- **Image uploads** -- Images posted in Discord are uploaded to your file host (`FILE_HOST_URL`), or to ImgBB if none is set, and the link is sent to mesh
+- **File attachments** -- Non-image files are sent with file type, size, and a link (e.g. `[PDF, 1.4MB] https://unym.pics/x7Kp2a.pdf`). Without a file host, the link is a TinyURL to the Discord CDN URL, which expires after about a day
+- **File host contract** -- `POST {FILE_HOST_URL}/upload` with `Authorization: Bearer <token>`, the raw file as the body, and an `X-Filename` header; respond with JSON `{"url": "..."}`
 - **Reaction mirroring** -- Discord emoji reactions on bridged messages are sent to mesh in MeshCoreOne-compatible format with correct hash
 - **Mention translation** -- Discord mentions (`@user`, `@role`, `#channel`) are resolved to readable names before forwarding to mesh
 - **`[D]` tag** -- Discord-origin messages are tagged with `[D]` so mesh users can identify them
@@ -240,7 +241,9 @@ Run `node setup.js` for guided configuration. Below is a reference of all config
 
 | Key | Description |
 |-----|-------------|
-| `IMGBB_API_KEY` | ImgBB API key for image uploads (get one at [api.imgbb.com](https://api.imgbb.com)) |
+| `FILE_HOST_URL` | Base URL of a self-hosted upload service (e.g. `https://unym.pics`). When set, images and files are re-uploaded there |
+| `FILE_HOST_TOKEN` | Bearer token for the file host's `POST /upload` endpoint |
+| `IMGBB_API_KEY` | ImgBB API key for image uploads (get one at [api.imgbb.com](https://api.imgbb.com)). Used when no file host is set, or as a fallback if the upload fails |
 
 ### Emergency Channel
 

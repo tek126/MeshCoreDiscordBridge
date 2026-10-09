@@ -175,7 +175,14 @@ async function main() {
   // ============================================================
   printSection("Image Uploads (Optional)");
 
-  printHelp("Images posted in Discord can be uploaded to ImgBB and the link sent to mesh.");
+  printHelp("Images and files posted in Discord can be uploaded to your own file host");
+  printHelp("(a service that accepts POST /upload with a Bearer token and returns {\"url\"}).");
+  config.FILE_HOST_URL = await ask("File host base URL, e.g. https://unym.pics (or Enter to skip)", existing.FILE_HOST_URL || "");
+  config.FILE_HOST_TOKEN = config.FILE_HOST_URL
+    ? await ask("File host upload token", existing.FILE_HOST_TOKEN || "")
+    : (existing.FILE_HOST_TOKEN || "");
+
+  printHelp("\nImgBB is used for images when no file host is set, or as a fallback if it fails.");
   printHelp("Sign up at https://imgbb.com, then get an API key at https://api.imgbb.com\n");
   config.IMGBB_API_KEY = await ask("ImgBB API key (or Enter to skip)", existing.IMGBB_API_KEY || "");
 
@@ -302,6 +309,7 @@ async function main() {
   console.log(`  Node Name:      ${config.MESH_NODE_NAME || "(not set)"}`);
   console.log(`  Routes:         ${Object.keys(config.DISCORD_ROUTES).length} configured`);
   console.log(`  Always-Forward: ${config.DISCORD_ALWAYS_FORWARD_CHANNEL_IDS.length} channels`);
+  console.log(`  File Host:      ${config.FILE_HOST_URL || "not set"}`);
   console.log(`  ImgBB:          ${config.IMGBB_API_KEY ? "configured" : "not set"}`);
   console.log(`  Emergency:      ${config.EMERGENCY_MESH_CHANNEL_IDX != null ? "configured" : "not set"}`);
   console.log(`  Welcome:        ${config.WELCOME_CHANNEL_MESSAGE ? "configured" : "not set"}`);
