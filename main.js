@@ -42,9 +42,15 @@ connection.onTraceDataPush = (bufferReader) => {
 // Pace all outgoing mesh transmissions, whichever code path sends them. Packets sent
 // back to back (e.g. a message followed by its attachment link) can reach a repeater
 // while it is still busy with the previous one and get dropped.
+// The library waits forever for the radio's Ok/Err reply, so a reply lost to a USB
+// glitch or radio reset would stall every later send; give up after a timeout instead.
 function getMeshMinSendGapMs() { return Math.max(0, Number(config.MESH_MIN_SEND_GAP_MS ?? 5000)); }
+const MESH_SEND_TIMEOUT_MS = 20_000;
 let meshPaceChain = Promise.resolve();
 let lastMeshSendAt = 0;
+// Epoch seconds the library stamped on the most recent channel/DM send. Read it right
+// after awaiting the send; reaction hashes must use this exact second.
+let lastMeshSendTs = 0;
 for (const method of ["sendChannelTextMessage", "sendTextMessage", "sendFloodAdvert"]) {
   const original = connection[method].bind(connection);
   connection[method] = (...args) => {
@@ -54,9 +60,17 @@ for (const method of ["sendChannelTextMessage", "sendTextMessage", "sendFloodAdv
         log.debug(`Pacing mesh ${method}: waiting ${wait}ms`);
         await sleep(wait);
       }
+      let timer;
       try {
-        return await original(...args);
+        lastMeshSendTs = Math.floor(Date.now() / 1000); // same tick the library stamps the packet
+        return await Promise.race([
+          original(...args),
+          new Promise((_, reject) => {
+            timer = setTimeout(() => reject(new Error(`mesh ${method} timed out`)), MESH_SEND_TIMEOUT_MS);
+          }),
+        ]);
       } finally {
+        clearTimeout(timer);
         lastMeshSendAt = Date.now();
       }
     });
@@ -66,27 +80,56 @@ for (const method of ["sendChannelTextMessage", "sendTextMessage", "sendFloodAdv
 }
 
 // ---- Discord webhook cache for mesh->discord messages ----
-const webhookCache = new Map(); // channelId -> WebhookClient
+// Caches the lookup promise, so concurrent messages for a new channel share one
+// fetch/create instead of each creating a webhook.
+const webhookCache = new Map(); // channelId -> Promise<Webhook|null>
 
-async function getOrCreateWebhook(channel) {
+function getOrCreateWebhook(channel) {
   const cached = webhookCache.get(channel.id);
   if (cached) return cached;
 
-  try {
-    // Look for an existing webhook created by us
-    const hooks = await channel.fetchWebhooks();
-    let hook = hooks.find(h => h.owner?.id === bot.user.id && h.name === "MeshCore Bridge");
+  const lookup = (async () => {
+    try {
+      // Look for an existing webhook created by us
+      const hooks = await channel.fetchWebhooks();
+      let hook = hooks.find(h => h.owner?.id === bot.user.id && h.name === "MeshCore Bridge");
 
-    if (!hook) {
-      hook = await channel.createWebhook({ name: "MeshCore Bridge", reason: "MeshCore bridge message forwarding" });
+      if (!hook) {
+        hook = await channel.createWebhook({ name: "MeshCore Bridge", reason: "MeshCore bridge message forwarding" });
+      }
+      return hook;
+    } catch (e) {
+      log.error(`Failed to get/create webhook for channel ${channel.id}:`, e);
+      webhookCache.delete(channel.id); // retry on the next message
+      return null;
     }
+  })();
+  webhookCache.set(channel.id, lookup);
+  return lookup;
+}
 
-    webhookCache.set(channel.id, hook);
-    return hook;
-  } catch (e) {
-    log.error(`Failed to get/create webhook for channel ${channel.id}:`, e);
-    return null;
+// Discord rejects webhook usernames that contain "discord" or "clyde", are empty, or are
+// exactly "everyone"/"here", which fails the whole post.
+function sanitizeWebhookUsername(name) {
+  let n = String(name || "").replace(/discord/gi, "Disc0rd").replace(/clyde/gi, "Clyd3").trim().slice(0, 80);
+  if (!n || /^(everyone|here)$/i.test(n)) n = "Mesh";
+  return n;
+}
+
+// Post a mesh message as its sender via webhook, falling back to a plain bot message
+// if the webhook is unavailable or the send fails, so the message is never lost.
+async function postMeshToDiscord(dest, senderName, body, { prefix = "", suffix = "" } = {}) {
+  const webhook = await getOrCreateWebhook(dest);
+  if (webhook) {
+    try {
+      const avatarURL = `https://api.dicebear.com/9.x/identicon/png?seed=${encodeURIComponent(senderName)}&size=128`;
+      return await webhook.send({ content: `${prefix}${body}${suffix}`, username: sanitizeWebhookUsername(senderName), avatarURL });
+    } catch (e) {
+      if (e.code === 10015) webhookCache.delete(dest.id); // webhook was deleted; recreate next time
+      log.error(`Webhook send failed for channel ${dest.id}, falling back to bot message:`, e);
+    }
   }
+  return dest.send(`${prefix}**${senderName}:** ${body}${suffix}`);
 }
 
 // ---- Path discovery (command 0x34, response 0x8D) ----
@@ -351,7 +394,7 @@ async function sendMeshChunked(channelIdx, fullText, onSent = null) {
     if (base.length <= getMeshMaxLen()) {
       log.debug(`mesh send (single) ch=${channelIdx} len=${base.length}: "${base}"`);
       await connection.sendChannelTextMessage(channelIdx, base);
-      const ts = Math.floor(Date.now() / 1000); // after the send: pacing may have delayed it
+      const ts = lastMeshSendTs; // the second the library stamped on this packet
       if (onSent) onSent(base, ts);
       return;
     }
@@ -602,7 +645,7 @@ function scheduleEmergencyReminder(discordChannelId) {
     try {
       const dest = await bot.channels.fetch(discordChannelId);
       if (dest?.isTextBased()) {
-        await dest.send("🚨 No response yet — emergency message still awaiting reply @everyone");
+        await dest.send({ content: "🚨 No response yet - emergency message still awaiting reply @everyone", allowedMentions: { parse: ["everyone"] } });
       }
     } catch (e) {
       log.error("Emergency reminder error:", e);
@@ -810,25 +853,35 @@ function getSchedules() {
   return config.SCHEDULED_MESSAGES || [];
 }
 
+const SCHEDULE_MIN_INTERVAL_MS = 15 * 60 * 1000;
+const SCHEDULE_MAX_INTERVAL_MS = 576 * 60 * 60 * 1000; // 24 days
+
 function parseCronSchedule(cronStr) {
   // Supports: "daily HH:MM", "weekly DAY HH:MM", "every Nh" / "every Nm"
   const s = cronStr.trim().toLowerCase();
 
+  const validTime = (h, m) => h <= 23 && m <= 59;
+
   const dailyMatch = s.match(/^daily\s+(\d{1,2}):(\d{2})$/);
   if (dailyMatch) {
-    return { type: "daily", hour: parseInt(dailyMatch[1]), minute: parseInt(dailyMatch[2]) };
+    const hour = parseInt(dailyMatch[1]), minute = parseInt(dailyMatch[2]);
+    return validTime(hour, minute) ? { type: "daily", hour, minute } : null;
   }
 
   const weeklyMatch = s.match(/^weekly\s+(mon|tue|wed|thu|fri|sat|sun)\s+(\d{1,2}):(\d{2})$/);
   if (weeklyMatch) {
     const days = { sun: 0, mon: 1, tue: 2, wed: 3, thu: 4, fri: 5, sat: 6 };
-    return { type: "weekly", day: days[weeklyMatch[1]], hour: parseInt(weeklyMatch[2]), minute: parseInt(weeklyMatch[3]) };
+    const hour = parseInt(weeklyMatch[2]), minute = parseInt(weeklyMatch[3]);
+    return validTime(hour, minute) ? { type: "weekly", day: days[weeklyMatch[1]], hour, minute } : null;
   }
 
   const everyMatch = s.match(/^every\s+(\d+)\s*(h|m)$/);
   if (everyMatch) {
     const val = parseInt(everyMatch[1]);
     const ms = everyMatch[2] === "h" ? val * 3600000 : val * 60000;
+    // A 0 interval would re-fire immediately forever, and setTimeout silently turns
+    // anything over ~24.8 days into 1ms.
+    if (ms < SCHEDULE_MIN_INTERVAL_MS || ms > SCHEDULE_MAX_INTERVAL_MS) return null;
     return { type: "interval", intervalMs: ms };
   }
 
@@ -920,13 +973,15 @@ function startSchedule(entry) {
     return;
   }
 
+  // clearTimeout can't stop a run that has already started, so a run in progress during
+  // /schedule remove or a reload re-arms only if its timer is still the current one.
   function scheduleNext() {
     const delay = msUntilNext(parsed);
     if (delay === null) return;
 
     const timer = setTimeout(async () => {
       await executeSchedule(entry);
-      scheduleNext();
+      if (activeScheduleTimers.get(entry.id) === timer) scheduleNext();
     }, delay);
 
     activeScheduleTimers.set(entry.id, timer);
@@ -1099,7 +1154,10 @@ const bot = new Client({
     GatewayIntentBits.GuildMembers,
     GatewayIntentBits.DirectMessages,
   ],
-  partials: [Partials.Message, Partials.Reaction, Partials.Channel],
+  partials: [Partials.Message, Partials.Reaction, Partials.Channel, Partials.User, Partials.GuildMember],
+  // Text from the mesh and from Discord users is relayed verbatim; never let it ping
+  // @everyone, roles or users. The emergency alerts opt in to @everyone explicitly.
+  allowedMentions: { parse: [], repliedUser: true },
 });
 
 // ---- Serial connection with auto-reconnect and health check ----
@@ -1191,12 +1249,37 @@ function scheduleReconnect() {
   reconnectTimer = setTimeout(async () => {
     reconnectTimer = null;
     try {
-      await connection.connect();
+      await connectMesh();
     } catch (e) {
       log.error("Reconnect failed:", e);
       scheduleReconnect();
     }
   }, RECONNECT_DELAY_MS);
+}
+
+// connect() replaces connection.serialPort without closing the old one, and it never
+// reports a failed open (serialport only logs it). So detach and close any old port
+// first, then retry if "connected" hasn't fired within CONNECT_VERIFY_MS.
+const CONNECT_VERIFY_MS = 10_000;
+let connectVerifyTimer = null;
+async function connectMesh() {
+  const old = connection.serialPort;
+  if (old) {
+    old.removeAllListeners();
+    old.on("error", () => {});
+    if (old.isOpen) old.close(() => {});
+  }
+  connection.readBuffer = []; // drop any partial frame from the old port
+
+  clearTimeout(connectVerifyTimer);
+  connectVerifyTimer = setTimeout(() => {
+    if (!meshConnected) {
+      log.error(`Mesh device on ${config.SERIAL_PORT || "/dev/ttyUSB0"} did not connect`);
+      scheduleReconnect();
+    }
+  }, CONNECT_VERIFY_MS);
+
+  await connection.connect();
 }
 
 // ---- Node join announcements (persisted to disk) ----
@@ -1666,15 +1749,63 @@ function getMeshChannelForDiscordChannel(discordChannelId) {
   return Number.isFinite(n) ? n : null;
 }
 
+function splitMeshSender(text) {
+  const cleaned = stripBridgePrefixes(text);
+  const colonIdx = cleaned.indexOf(": ");
+  if (colonIdx > 0 && colonIdx < 30) {
+    return { senderName: cleaned.slice(0, colonIdx).trim(), meshBody: cleaned.slice(colonIdx + 2).trim() };
+  }
+  return { senderName: "Mesh", meshBody: cleaned };
+}
+
+async function handleEmergencyMessage(text, channelIdx) {
+  const emergencyChannelId = getEmergencyDiscordChannelId();
+  try {
+    const dest = await bot.channels.fetch(emergencyChannelId);
+    if (!dest?.isTextBased()) {
+      log.error(`Emergency Discord channel ${emergencyChannelId} is not a text channel`);
+      return;
+    }
+    const now = Date.now();
+    const isNewEmergency = !emergencyState.active || (now - emergencyState.lastAlertAt) > getEmergencyCooldownMs();
+    const { senderName, meshBody } = splitMeshSender(text);
+
+    if (isNewEmergency) {
+      // First message: alert, forward the message, reply to mesh, start the reminder
+      emergencyState.active = true;
+      emergencyState.lastAlertAt = now;
+      await dest.send({ content: "🚨 **Emergency Message Incoming** @everyone", allowedMentions: { parse: ["everyone"] } });
+      await postMeshToDiscord(dest, senderName, meshBody);
+      scheduleEmergencyReminder(emergencyChannelId);
+      await enqueueMeshSend(() =>
+        connection.sendChannelTextMessage(channelIdx,
+          "Your message has been forwarded to Discord. Stand by for a reply. This channel is for emergency use only.")
+      );
+    } else {
+      // Subsequent message: just forward, no ping or reply
+      await postMeshToDiscord(dest, senderName, meshBody);
+    }
+  } catch (e) {
+    log.error("Emergency channel error:", e);
+  }
+}
+
 async function onMeshChannelMessageReceived(channelMessage) {
+  const text = channelMessage?.text ?? "";
+  const channelIdx = channelMessage?.channelIdx;
+
+  // Emergency channel handling comes first: pause, block list and language filter must
+  // never stop an emergency from reaching Discord.
+  if (isEmergencyMeshChannel(channelIdx) && getEmergencyDiscordChannelId() && !isPocketMeshReact(text)) {
+    await handleEmergencyMessage(text, channelIdx);
+    return; // Don't process through normal routing
+  }
+
   // Bridge pause gate: Mesh -> Discord
   if (isBridgePaused()) {
     log.debug("[debug] Bridge paused; dropping mesh->discord message");
     return;
   }
-
-  const text = channelMessage?.text ?? "";
-  const channelIdx = channelMessage?.channelIdx;
 
   // Handle PocketMesh emoji reactions — apply to matching Discord message
   if (isPocketMeshReact(text)) {
@@ -1697,7 +1828,7 @@ async function onMeshChannelMessageReceived(channelMessage) {
         await msg.react(parsed.emoji);
       } catch (e) {
         // Mesh clients often append U+FE0F to emoji Discord only knows without it (e.g. 👍️, ☕️)
-        const stripped = parsed.emoji.replace(/️/g, "");
+        const stripped = parsed.emoji.replace(/\uFE0F/g, "");
         if (e.code !== 10014 || stripped === parsed.emoji) throw e;
         await msg.react(stripped);
       }
@@ -1819,80 +1950,6 @@ async function onMeshChannelMessageReceived(channelMessage) {
     }
   }
 
-  // Emergency channel handling
-  if (isEmergencyMeshChannel(channelIdx)) {
-    const emergencyChannelId = getEmergencyDiscordChannelId();
-    if (emergencyChannelId) {
-      try {
-        const dest = await bot.channels.fetch(emergencyChannelId);
-        if (dest?.isTextBased()) {
-          const now = Date.now();
-          const isNewEmergency = !emergencyState.active || (now - emergencyState.lastAlertAt) > getEmergencyCooldownMs();
-
-          if (isNewEmergency) {
-            // First message — send alert, forward message, reply to mesh
-            emergencyState.active = true;
-            emergencyState.lastAlertAt = now;
-
-            await dest.send("🚨 **Emergency Message Incoming** @everyone");
-
-            // Forward the message via webhook
-            let cleaned = stripBridgePrefixes(text);
-            const colonIdx = cleaned.indexOf(": ");
-            let senderName, meshBody;
-            if (colonIdx > 0 && colonIdx < 30) {
-              senderName = cleaned.slice(0, colonIdx).trim();
-              meshBody = cleaned.slice(colonIdx + 2).trim();
-            } else {
-              senderName = "Mesh";
-              meshBody = cleaned;
-            }
-
-            const webhook = await getOrCreateWebhook(dest);
-            if (webhook) {
-              const avatarURL = `https://api.dicebear.com/9.x/identicon/png?seed=${encodeURIComponent(senderName)}&size=128`;
-              await webhook.send({ content: meshBody, username: senderName, avatarURL });
-            } else {
-              await dest.send(`**${senderName}:** ${meshBody}`);
-            }
-
-            // Reply to mesh
-            await enqueueMeshSend(() =>
-              connection.sendChannelTextMessage(channelIdx,
-                "Your message has been forwarded to Discord. Stand by for a reply. This channel is for emergency use only.")
-            );
-
-            // Start reminder timer
-            scheduleEmergencyReminder(emergencyChannelId);
-          } else {
-            // Subsequent message — just forward, no ping or reply
-            let cleaned = stripBridgePrefixes(text);
-            const colonIdx = cleaned.indexOf(": ");
-            let senderName, meshBody;
-            if (colonIdx > 0 && colonIdx < 30) {
-              senderName = cleaned.slice(0, colonIdx).trim();
-              meshBody = cleaned.slice(colonIdx + 2).trim();
-            } else {
-              senderName = "Mesh";
-              meshBody = cleaned;
-            }
-
-            const webhook = await getOrCreateWebhook(dest);
-            if (webhook) {
-              const avatarURL = `https://api.dicebear.com/9.x/identicon/png?seed=${encodeURIComponent(senderName)}&size=128`;
-              await webhook.send({ content: meshBody, username: senderName, avatarURL });
-            } else {
-              await dest.send(`**${senderName}:** ${meshBody}`);
-            }
-          }
-        }
-      } catch (e) {
-        log.error("Emergency channel error:", e);
-      }
-      return; // Don't process through normal routing
-    }
-  }
-
   // Route by Meshcore channel index
   const explicitRoute = config.DISCORD_ROUTES?.[String(channelIdx)];
   const routeChannelId = explicitRoute ?? config.DISCORD_CHANNEL_ID;
@@ -1950,15 +2007,7 @@ async function onMeshChannelMessageReceived(channelMessage) {
     const pathStr = await buildPathString(channelMessage);
 
     // Send via webhook so the sender name appears as the message author
-    let sentMsg;
-    const webhook = await getOrCreateWebhook(dest);
-    if (webhook) {
-      const avatarURL = `https://api.dicebear.com/9.x/identicon/png?seed=${encodeURIComponent(senderName)}&size=128`;
-      sentMsg = await webhook.send({ content: `${channelTag}${meshBody}\n${pathStr}`, username: senderName, avatarURL });
-    } else {
-      // Fallback to bot message if webhook fails
-      sentMsg = await dest.send(`${channelTag}**${senderName}:** ${meshBody}\n${pathStr}`);
-    }
+    const sentMsg = await postMeshToDiscord(dest, senderName, meshBody, { prefix: channelTag, suffix: `\n${pathStr}` });
 
     // Track message for reaction matching
     // Hash the body without sender name (for reactions from the sender's own device)
@@ -2058,7 +2107,7 @@ async function handleSend(text, authorName, reply, meshChannelIdx = 0, discordMs
 
   await enqueueMeshSend(async () => {
     await connection.sendChannelTextMessage(meshChannelIdx, meshText);
-    const ts = Math.floor(Date.now() / 1000); // after the send: pacing may have delayed it
+    const ts = lastMeshSendTs; // the second the library stamped on this packet
     metrics.discordToMesh++;
     metrics.lastDiscordForward = Date.now();
     if (discordMsgId) {
@@ -2647,7 +2696,7 @@ bot.on("interactionCreate", async (interaction) => {
         // Validate cron
         const parsed = parseCronSchedule(cron);
         if (!parsed) {
-          await interaction.editReply("Invalid schedule format. Use: `daily HH:MM`, `weekly mon HH:MM`, or `every Nh`/`every Nm`");
+          await interaction.editReply("Invalid schedule. Use: `daily HH:MM`, `weekly mon HH:MM`, or `every Nh`/`every Nm` (intervals between 15m and 576h).");
           return;
         }
 
@@ -3021,7 +3070,7 @@ bot.on("messageCreate", async (message) => {
         }
         await enqueueMeshSend(async () => {
           await connection.sendChannelTextMessage(meshIdx, meshText);
-          const ts = Math.floor(Date.now() / 1000); // after the send: pacing may have delayed it
+          const ts = lastMeshSendTs; // the second the library stamped on this packet
           trackOutgoing(meshText, ts);
         });
         if (wasTruncated) {
@@ -3219,7 +3268,7 @@ if (config.WEB_PORT) {
 }
 
 try {
-  await connection.connect();
+  await connectMesh();
 } catch (e) {
   log.error(`Failed to connect to meshcore device on ${config.SERIAL_PORT || "/dev/ttyUSB0"}:`, e.message);
   process.exit(1);
