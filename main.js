@@ -39,6 +39,32 @@ connection.onTraceDataPush = (bufferReader) => {
   }
 };
 
+// Pace all outgoing mesh transmissions, whichever code path sends them. Packets sent
+// back to back (e.g. a message followed by its attachment link) can reach a repeater
+// while it is still busy with the previous one and get dropped.
+function getMeshMinSendGapMs() { return Math.max(0, Number(config.MESH_MIN_SEND_GAP_MS ?? 5000)); }
+let meshPaceChain = Promise.resolve();
+let lastMeshSendAt = 0;
+for (const method of ["sendChannelTextMessage", "sendTextMessage", "sendFloodAdvert"]) {
+  const original = connection[method].bind(connection);
+  connection[method] = (...args) => {
+    const run = meshPaceChain.then(async () => {
+      const wait = lastMeshSendAt + getMeshMinSendGapMs() - Date.now();
+      if (wait > 0) {
+        log.debug(`Pacing mesh ${method}: waiting ${wait}ms`);
+        await sleep(wait);
+      }
+      try {
+        return await original(...args);
+      } finally {
+        lastMeshSendAt = Date.now();
+      }
+    });
+    meshPaceChain = run.catch(() => {});
+    return run;
+  };
+}
+
 // ---- Discord webhook cache for mesh->discord messages ----
 const webhookCache = new Map(); // channelId -> WebhookClient
 
@@ -324,8 +350,8 @@ async function sendMeshChunked(channelIdx, fullText, onSent = null) {
     // If it fits as-is, send once with no suffix.
     if (base.length <= getMeshMaxLen()) {
       log.debug(`mesh send (single) ch=${channelIdx} len=${base.length}: "${base}"`);
-      const ts = Math.floor(Date.now() / 1000);
       await connection.sendChannelTextMessage(channelIdx, base);
+      const ts = Math.floor(Date.now() / 1000); // after the send: pacing may have delayed it
       if (onSent) onSent(base, ts);
       return;
     }
@@ -2031,8 +2057,8 @@ async function handleSend(text, authorName, reply, meshChannelIdx = 0, discordMs
   }
 
   await enqueueMeshSend(async () => {
-    const ts = Math.floor(Date.now() / 1000);
     await connection.sendChannelTextMessage(meshChannelIdx, meshText);
+    const ts = Math.floor(Date.now() / 1000); // after the send: pacing may have delayed it
     metrics.discordToMesh++;
     metrics.lastDiscordForward = Date.now();
     if (discordMsgId) {
@@ -2994,8 +3020,8 @@ bot.on("messageCreate", async (message) => {
           wasTruncated = true;
         }
         await enqueueMeshSend(async () => {
-          const ts = Math.floor(Date.now() / 1000);
           await connection.sendChannelTextMessage(meshIdx, meshText);
+          const ts = Math.floor(Date.now() / 1000); // after the send: pacing may have delayed it
           trackOutgoing(meshText, ts);
         });
         if (wasTruncated) {

@@ -295,6 +295,7 @@ Run `node setup.js` for guided configuration. Below is a reference of all config
 |-----|-------------|
 | `MESH_MAXLEN` | Max message length for mesh in characters (default `160`) |
 | `MESH_CHUNK_DELAY_MS` | Delay in ms between chunked message parts (default `2500`) |
+| `MESH_MIN_SEND_GAP_MS` | Minimum gap in ms between any two mesh transmissions, so repeaters aren't handed packets back to back (default `5000`, `0` disables) |
 
 ### Flood Protection (`FLOOD_PROTECT`)
 
