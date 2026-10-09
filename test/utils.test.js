@@ -6,6 +6,8 @@ import {
   escapeRegex,
   normalizeForMesh,
   splitByMaxLen,
+  utf8Len,
+  truncateUtf8,
 } from "../lib/utils.js";
 
 describe("encodeCrockfordBase32", () => {
@@ -130,5 +132,40 @@ describe("splitByMaxLen", () => {
     // Verify no content is lost (accounting for trimmed whitespace)
     const rejoined = chunks.join(" ");
     assert.equal(rejoined.replace(/\s+/g, " "), text.replace(/\s+/g, " "));
+  });
+});
+
+describe("UTF-8 byte limits", () => {
+  it("utf8Len counts bytes, not characters", () => {
+    assert.equal(utf8Len("abc"), 3);
+    assert.equal(utf8Len("\u00e9"), 2);
+    assert.equal(utf8Len("\u{1F600}"), 4);
+  });
+
+  it("truncateUtf8 never splits a character", () => {
+    assert.equal(truncateUtf8("a\u{1F600}b", 4), "a");
+    assert.equal(truncateUtf8("a\u{1F600}b", 5), "a\u{1F600}");
+    assert.equal(truncateUtf8("short", 10), "short");
+  });
+
+  it("splitByMaxLen keeps every chunk within the byte limit and whole characters", () => {
+    const text = "\u{1F600}".repeat(100);
+    const chunks = splitByMaxLen(text, 154);
+    for (const chunk of chunks) {
+      assert.ok(utf8Len(chunk) <= 154, `chunk is ${utf8Len(chunk)} bytes`);
+      assert.ok(!/[\uD800-\uDBFF]$/.test(chunk), "chunk ends in a lone high surrogate");
+    }
+    assert.equal(chunks.join(""), text);
+  });
+
+  it("splitByMaxLen measures accented text in bytes", () => {
+    const text = "caf\u00e9 ".repeat(40).trim();
+    for (const chunk of splitByMaxLen(text, 50)) assert.ok(utf8Len(chunk) <= 50);
+  });
+
+  it("splitByMaxLen survives a NaN limit instead of looping forever", () => {
+    const chunks = splitByMaxLen("x".repeat(400), NaN);
+    assert.ok(chunks.length >= 3);
+    for (const chunk of chunks) assert.ok(utf8Len(chunk) <= 160);
   });
 });

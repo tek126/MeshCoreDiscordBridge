@@ -12,7 +12,7 @@ import {
 import fs from "fs";
 import log from "./lib/logger.js";
 import { loadConfig, saveConfigAtomic, validateConfig } from "./lib/config.js";
-import { escapeRegex, normalizeForMesh, sleep, splitByMaxLen, generateMeshHash } from "./lib/utils.js";
+import { escapeRegex, normalizeForMesh, sleep, splitByMaxLen, generateMeshHash, utf8Len, truncateUtf8 } from "./lib/utils.js";
 import {
   isPocketMeshReact, parseMeshReaction, trackMessage, findHashByDiscordMessageId,
   getMessageHistory, isDuplicate, flushHistory, clearHistorySaveTimer, HISTORY_MAX_AGE_MS,
@@ -217,7 +217,16 @@ function stripBridgePrefixes(text) {
   return result;
 }
 
-function getMeshMaxLen() { return Number(config.MESH_MAXLEN ?? 160); }
+// Firmware caps text at 160 UTF-8 bytes. For channel messages that includes the
+// "<node name>: " prefix it adds, so the usable budget depends on our node's name.
+const MESH_TEXT_MAX_BYTES = 160;
+let meshSelfName = config.MESH_NODE_NAME || "";
+function getConfiguredMaxLen() { return Number(config.MESH_MAXLEN) || MESH_TEXT_MAX_BYTES; }
+function getMeshMaxLen() {
+  const budget = MESH_TEXT_MAX_BYTES - utf8Len(meshSelfName) - 2;
+  return Math.max(20, Math.min(getConfiguredMaxLen(), budget));
+}
+function getMeshDmMaxLen() { return Math.min(getConfiguredMaxLen(), MESH_TEXT_MAX_BYTES); }
 function getMeshChunkDelayMs() { return Number(config.MESH_CHUNK_DELAY_MS ?? 2500); }
 
 function getAlwaysForwardChannelIds() {
@@ -270,6 +279,8 @@ async function uploadToImgBB(imageUrl) {
     return null;
   }
 }
+
+const MAX_ATTACHMENT_LINKS = 2;
 
 // ---- Self-hosted file upload (e.g. unym.pics), used for images and other files ----
 // The service takes raw bytes with a Bearer token and returns {"url"}. Discord CDN links
@@ -373,11 +384,36 @@ async function resolveMentions(text, guild) {
 // ---- Mesh send serialization queue ----
 let meshSendChain = Promise.resolve();
 
-function enqueueMeshSend(taskFn) {
-  meshSendChain = meshSendChain
-    .then(taskFn)
-    .catch((e) => log.error("Mesh send task error:", e));
-  return meshSendChain;
+// Serialized mesh send queue. Resolves to { ok, value } and never rejects, so callers
+// can report failures without a throw escaping into message handlers. The queue is
+// capped (pacing drains at most one send per gap, so a backlog only makes messages
+// arrive minutes late), and pausing the bridge drops whatever is still queued.
+const MESH_QUEUE_MAX = 20;
+let meshQueueDepth = 0;
+let meshQueueEpoch = 0;
+function enqueueMeshSend(taskFn, { force = false } = {}) {
+  if (!force && meshQueueDepth >= MESH_QUEUE_MAX) {
+    log.warn(`Mesh send queue full (${meshQueueDepth}); dropping send`);
+    return Promise.resolve({ ok: false, error: new Error("mesh send queue full") });
+  }
+  meshQueueDepth++;
+  const epoch = meshQueueEpoch;
+  const run = meshSendChain
+    .then(() => {
+      if (epoch !== meshQueueEpoch && !force) throw new Error("dropped: bridge was paused");
+      return taskFn();
+    })
+    .then(
+      (value) => ({ ok: true, value }),
+      (error) => {
+        if (epoch !== meshQueueEpoch && !force) log.info("Dropped queued mesh send (bridge paused)");
+        else log.error("Mesh send task error:", error);
+        return { ok: false, error };
+      },
+    )
+    .finally(() => { meshQueueDepth--; });
+  meshSendChain = run;
+  return run;
 }
 
 /**
@@ -391,8 +427,8 @@ async function sendMeshChunked(channelIdx, fullText, onSent = null) {
 
   return enqueueMeshSend(async () => {
     // If it fits as-is, send once with no suffix.
-    if (base.length <= getMeshMaxLen()) {
-      log.debug(`mesh send (single) ch=${channelIdx} len=${base.length}: "${base}"`);
+    if (utf8Len(base) <= getMeshMaxLen()) {
+      log.debug(`mesh send (single) ch=${channelIdx} bytes=${utf8Len(base)}: "${base}"`);
       await connection.sendChannelTextMessage(channelIdx, base);
       const ts = lastMeshSendTs; // the second the library stamped on this packet
       if (onSent) onSent(base, ts);
@@ -414,23 +450,21 @@ async function sendMeshChunked(channelIdx, fullText, onSent = null) {
 
     const total2 = chunks.length;
 
-    log.debug(`mesh send (chunked) ch=${channelIdx} parts=${total2} maxLen=${getMeshMaxLen()} delayMs=${getMeshChunkDelayMs()}`);
+    log.debug(`mesh send (chunked) ch=${channelIdx} parts=${total2} maxBytes=${getMeshMaxLen()} delayMs=${getMeshChunkDelayMs()}`);
 
+    let failed = 0;
     for (let idx = 0; idx < total2; idx++) {
       const partNum = idx + 1;
       const suffix = ` ${partNum}/${total2}`;
-      let payload = chunks[idx];
-
       // Final guard: ensure payload+suffix fits
-      const allowed = getMeshMaxLen() - suffix.length;
-      if (payload.length > allowed) payload = payload.slice(0, allowed);
-
+      const payload = truncateUtf8(chunks[idx], getMeshMaxLen() - suffix.length);
       const out = payload + suffix;
 
       try {
-          log.debug(`mesh chunk ${partNum}/${total2} ch=${channelIdx} len=${out.length}: "${out}"`)
+        log.debug(`mesh chunk ${partNum}/${total2} ch=${channelIdx} bytes=${utf8Len(out)}: "${out}"`);
         await connection.sendChannelTextMessage(channelIdx, out);
       } catch (e) {
+        failed++;
         log.error(`Mesh chunk send failed ${partNum}/${total2} ch=${channelIdx}:`, e);
       }
 
@@ -438,6 +472,7 @@ async function sendMeshChunked(channelIdx, fullText, onSent = null) {
         await sleep(getMeshChunkDelayMs());
       }
     }
+    if (failed) throw new Error(`${failed}/${total2} mesh chunks failed`);
   });
 }
 
@@ -449,19 +484,19 @@ async function sendDMChunked(publicKey, fullText) {
   if (!base) return;
 
   return enqueueMeshSend(async () => {
-    if (base.length <= getMeshMaxLen()) {
-      log.debug(`DM send (single) len=${base.length}: "${base}"`);
+    if (utf8Len(base) <= getMeshDmMaxLen()) {
+      log.debug(`DM send (single) bytes=${utf8Len(base)}: "${base}"`);
       await connection.sendTextMessage(publicKey, base);
       return;
     }
 
     const suffixReserve = 6;
-    const maxPayload = Math.max(1, getMeshMaxLen() - suffixReserve);
+    const maxPayload = Math.max(1, getMeshDmMaxLen() - suffixReserve);
     let chunks = splitByMaxLen(base, maxPayload);
 
     const total = chunks.length;
     const suffixLen = (` ${total}/${total}`).length;
-    const maxPayload2 = Math.max(1, getMeshMaxLen() - suffixLen);
+    const maxPayload2 = Math.max(1, getMeshDmMaxLen() - suffixLen);
     if (maxPayload2 !== maxPayload) {
       chunks = splitByMaxLen(base, maxPayload2);
     }
@@ -469,21 +504,22 @@ async function sendDMChunked(publicKey, fullText) {
     const total2 = chunks.length;
     log.debug(`DM send (chunked) parts=${total2}`);
 
+    let failed = 0;
     for (let idx = 0; idx < total2; idx++) {
       const partNum = idx + 1;
       const suffix = ` ${partNum}/${total2}`;
-      let payload = chunks[idx];
-      const allowed = getMeshMaxLen() - suffix.length;
-      if (payload.length > allowed) payload = payload.slice(0, allowed);
+      const payload = truncateUtf8(chunks[idx], getMeshDmMaxLen() - suffix.length);
 
       try {
         await connection.sendTextMessage(publicKey, payload + suffix);
       } catch (e) {
+        failed++;
         log.error(`DM chunk send failed ${partNum}/${total2}:`, e);
       }
 
       if (idx !== total2 - 1) await sleep(getMeshChunkDelayMs());
     }
+    if (failed) throw new Error(`${failed}/${total2} DM chunks failed`);
   });
 }
 
@@ -511,6 +547,7 @@ function isBridgePaused() {
 }
 
 function setBridgePaused(paused, actorTag = null) {
+  if (paused && !bridgeState.paused) meshQueueEpoch++; // drop sends already queued
   bridgeState.paused = !!paused;
   bridgeState.pausedBy = paused ? actorTag : null;
   bridgeState.pausedAt = paused ? new Date().toISOString() : null;
@@ -560,7 +597,7 @@ function _getFloodRecord(channelId) {
  * Returns true if we should allow forwarding this Discord channel's messages to Meshcore.
  * If false, we're currently rate-limited (cooldown).
  */
-async function floodAllowDiscordToMesh(messageLike) {
+async function floodAllowDiscordToMesh(messageLike, cost = 1) {
   const channelId = String(messageLike?.channel?.id ?? "");
   if (!channelId) return true;
 
@@ -579,8 +616,8 @@ async function floodAllowDiscordToMesh(messageLike) {
   const cutoff = now - flood.windowMs;
   rec.times = rec.times.filter(t => t >= cutoff);
 
-  // Record this message
-  rec.times.push(now);
+  // Record this message, one entry per mesh packet it will produce
+  for (let i = 0; i < Math.max(1, cost); i++) rec.times.push(now);
 
   // If exceeded, start cooldown
   if (rec.times.length > flood.max) {
@@ -1212,6 +1249,15 @@ connection.on("connected", async () => {
   log.info("Connected to meshcore!");
   meshConnected = true;
 
+  // The channel-text byte budget depends on our node name (firmware prepends it)
+  try {
+    const self = await connection.getSelfInfo(5000);
+    if (self?.name) meshSelfName = self.name;
+    log.info(`Mesh node name "${meshSelfName}": channel text budget ${getMeshMaxLen()} bytes`);
+  } catch (e) {
+    log.warn(`Could not read node name from radio; using MESH_NODE_NAME: ${e?.message ?? e}`);
+  }
+
   // Seed known nodes so we don't announce existing contacts on restart
   try {
     const contacts = await connection.getContacts();
@@ -1758,6 +1804,9 @@ function splitMeshSender(text) {
   return { senderName: "Mesh", meshBody: cleaned };
 }
 
+const LANG_FILTER_REPLY_COOLDOWN_MS = 60_000;
+const langFilterLastReply = new Map(); // mesh channelIdx -> ms
+
 async function handleEmergencyMessage(text, channelIdx) {
   const emergencyChannelId = getEmergencyDiscordChannelId();
   try {
@@ -1779,7 +1828,8 @@ async function handleEmergencyMessage(text, channelIdx) {
       scheduleEmergencyReminder(emergencyChannelId);
       await enqueueMeshSend(() =>
         connection.sendChannelTextMessage(channelIdx,
-          "Your message has been forwarded to Discord. Stand by for a reply. This channel is for emergency use only.")
+          "Your message has been forwarded to Discord. Stand by for a reply. This channel is for emergency use only."),
+        { force: true },
       );
     } else {
       // Subsequent message: just forward, no ping or reply
@@ -1850,9 +1900,16 @@ async function onMeshChannelMessageReceived(channelMessage) {
   // Language warning back to mesh + echo to routed Discord channel (configurable)
   const langFilter = config.LANGUAGE_FILTER;
   if (langFilter && langFilter.ENABLED !== false && Array.isArray(langFilter.WORDS) && langFilter.WORDS.length > 0) {
-    const lower = text.toLowerCase();
-    const triggered = langFilter.WORDS.some(w => lower.includes(w.toLowerCase()));
-    if (triggered) {
+    // Whole-word match ("class" must not trigger on "ass"), and at most one reply per
+    // channel per minute so repeating a word can't make the bridge spam the mesh.
+    const triggered = langFilter.WORDS.some(w => w &&
+      new RegExp(`(?<![\\p{L}\\p{N}])${escapeRegex(String(w))}(?![\\p{L}\\p{N}])`, "iu").test(text));
+    const idxKey = String(channelMessage?.channelIdx ?? 0);
+    const lastReply = langFilterLastReply.get(idxKey) || 0;
+    if (triggered && Date.now() - lastReply < LANG_FILTER_REPLY_COOLDOWN_MS) {
+      log.debug(`Language filter triggered on ch=${idxKey}; reply suppressed (cooldown)`);
+    } else if (triggered) {
+      langFilterLastReply.set(idxKey, Date.now());
       const response = langFilter.RESPONSE || "Language!!!";
       const idx = Number(channelMessage?.channelIdx ?? 0);
 
@@ -1911,7 +1968,8 @@ async function onMeshChannelMessageReceived(channelMessage) {
         await enqueueMeshSend(() =>
           connection.sendChannelTextMessage(channelIdx, "Your appeal has been forwarded.")
         );
-      } else {
+      } else if (!isSameDay(state.lastAppealNotice, now)) {
+        state.lastAppealNotice = now; // tell them once; further "appeal"s get no reply
         await enqueueMeshSend(() =>
           connection.sendChannelTextMessage(channelIdx, "You have already submitted an appeal today.")
         );
@@ -2074,13 +2132,28 @@ bot.once("ready", async () => {
   }
 });
 
-async function handleAdvert(reply) {
+// A flood advert is repeated by every repeater on the mesh, so limit how often
+// non-admins can trigger one.
+const ADVERT_COOLDOWN_MS = 15 * 60 * 1000;
+let lastAdvertAt = 0;
+async function handleAdvert(reply, member) {
   if (isBridgePaused()) {
     await reply("Bridge is paused; not sending advert to mesh.");
     return;
   }
-  await connection.sendFloodAdvert();
-  await reply("Sending Flood Advert!");
+  const waitMs = lastAdvertAt + ADVERT_COOLDOWN_MS - Date.now();
+  if (waitMs > 0 && !isBridgeAdminMember(member)) {
+    await reply(`An advert was sent recently; try again in ${Math.ceil(waitMs / 60000)} min.`);
+    return;
+  }
+  lastAdvertAt = Date.now();
+  try {
+    await connection.sendFloodAdvert();
+    await reply("Sending Flood Advert!");
+  } catch (e) {
+    log.error("Flood advert failed:", e);
+    await reply("Failed to send flood advert.");
+  }
 }
 
 async function handleSend(text, authorName, reply, meshChannelIdx = 0, discordMsgId = null, discordChannelId = null) {
@@ -2100,12 +2173,12 @@ async function handleSend(text, authorName, reply, meshChannelIdx = 0, discordMs
   let meshText = normalizedText;
   let wasTruncated = false;
 
-  if (normalizedText.length > getMeshMaxLen()) {
-    meshText = normalizedText.slice(0, getMeshMaxLen() - 1) + "\u2026";
+  if (utf8Len(normalizedText) > getMeshMaxLen()) {
+    meshText = truncateUtf8(normalizedText, getMeshMaxLen() - 3) + "\u2026"; // ellipsis is 3 bytes
     wasTruncated = true;
   }
 
-  await enqueueMeshSend(async () => {
+  const result = await enqueueMeshSend(async () => {
     await connection.sendChannelTextMessage(meshChannelIdx, meshText);
     const ts = lastMeshSendTs; // the second the library stamped on this packet
     metrics.discordToMesh++;
@@ -2124,12 +2197,17 @@ async function handleSend(text, authorName, reply, meshChannelIdx = 0, discordMs
     }
   });
 
-  if (wasTruncated) {
-    await reply(`Message truncated to ${getMeshMaxLen()} chars for mesh (was ${normalizedText.length}). Sent to channel ${meshChannelIdx}.`);
+  if (!result.ok) {
+    await reply(`Failed to send to mesh channel ${meshChannelIdx}: ${result.error?.message ?? "radio error"}`);
+  } else if (wasTruncated) {
+    await reply(`Message truncated to ${getMeshMaxLen()} bytes for mesh (was ${utf8Len(normalizedText)}). Sent to channel ${meshChannelIdx}.`);
   } else {
     await reply(`Sent to mesh channel ${meshChannelIdx}: ${text}`);
   }
 }
+
+const REPEATER_COOLDOWN_MS = 60_000;
+const repeaterLastUse = new Map(); // Discord user id -> ms
 
 bot.on("interactionCreate", async (interaction) => {
   try {
@@ -2513,6 +2591,14 @@ bot.on("interactionCreate", async (interaction) => {
     if (interaction.commandName === "repeater") {
       await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
+      // Each live-status request is a mesh transmission and holds the send queue
+      const lastUse = repeaterLastUse.get(interaction.user.id) || 0;
+      if (Date.now() - lastUse < REPEATER_COOLDOWN_MS && !isBridgeAdminMember(interaction.member)) {
+        await interaction.editReply(`Please wait ${Math.ceil((lastUse + REPEATER_COOLDOWN_MS - Date.now()) / 1000)}s before requesting another repeater status.`);
+        return;
+      }
+      repeaterLastUse.set(interaction.user.id, Date.now());
+
       const name = interaction.options.getString("name");
       try {
         const contacts = await connection.getContacts();
@@ -2552,7 +2638,13 @@ bot.on("interactionCreate", async (interaction) => {
         if (contact.outPathLen >= 0 && contact.outPathLen !== 0xFF) {
           try {
             log.debug(`Requesting live status from "${name}" pathLen=${contact.outPathLen}`);
-            const status = await enqueueMeshSend(() => connection.getStatus(contact.publicKey, 15000));
+            // The library only starts its timeout after the radio's Sent reply, so cap
+            // the whole request; it holds the shared send queue while it waits.
+            const res = await enqueueMeshSend(() => Promise.race([
+              connection.getStatus(contact.publicKey, 15000),
+              sleep(30_000).then(() => { throw new Error("timeout"); }),
+            ]));
+            const status = res.ok ? res.value : null;
             if (status) {
               const battery = status.batt_milli_volts ? `${(status.batt_milli_volts / 1000).toFixed(2)}V` : "N/A";
               const uptime = status.total_up_time_secs ? `${Math.floor(status.total_up_time_secs / 3600)}h ${Math.floor((status.total_up_time_secs % 3600) / 60)}m` : "N/A";
@@ -2875,7 +2967,7 @@ bot.on("interactionCreate", async (interaction) => {
 
     if (interaction.commandName === "advert") {
       await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-      await handleAdvert((msg) => interaction.editReply(msg));
+      await handleAdvert((msg) => interaction.editReply(msg), interaction.member);
     }
 
     if (interaction.commandName === "send") {
@@ -2979,8 +3071,10 @@ bot.on("messageCreate", async (message) => {
         return;
       }
 
-      // Flood protection gate
-      if (!(await floodAllowDiscordToMesh(message))) return;
+      // Flood protection gate: one slot per mesh packet (text + up to 2 attachment links)
+      const packetCost = (message.content?.trim() || message.reference?.messageId ? 1 : 0)
+        + Math.min(message.attachments.size, MAX_ATTACHMENT_LINKS);
+      if (!(await floodAllowDiscordToMesh(message, packetCost))) return;
 
       const meshIdx = getMeshChannelForDiscordChannel(message.channel.id);
       if (meshIdx === null) {
@@ -2995,9 +3089,12 @@ bot.on("messageCreate", async (message) => {
 
       // Handle attachments: uploaded to the file host if configured, otherwise images go to
       // ImgBB and other files get a TinyURL to the Discord CDN link
+      // Only the first MAX_ATTACHMENT_LINKS get links; each is its own mesh packet.
       const allAtts = [...message.attachments.values()];
-      const imageAtts = allAtts.filter(isImageAttachment);
-      const fileAtts = allAtts.filter(a => !isImageAttachment(a));
+      const linkedAtts = allAtts.slice(0, MAX_ATTACHMENT_LINKS);
+      const extraAtts = allAtts.length - linkedAtts.length;
+      const imageAtts = linkedAtts.filter(isImageAttachment);
+      const fileAtts = linkedAtts.filter(a => !isImageAttachment(a));
 
       const attachmentLines = [];
 
@@ -3015,6 +3112,10 @@ bot.on("messageCreate", async (message) => {
         const ext = (att.name?.split('.').pop() || 'file').toUpperCase();
         const link = (await uploadToFileHost(att)) || (await shortenUrl(att.url));
         attachmentLines.push(`[${ext}, ${sizeStr}] ${link}`);
+      }
+
+      if (extraAtts > 0 && attachmentLines.length > 0) {
+        attachmentLines[attachmentLines.length - 1] += ` (+${extraAtts} more in Discord)`;
       }
 
       let content = (message.content || "").trim();
@@ -3044,6 +3145,12 @@ bot.on("messageCreate", async (message) => {
       // Skip if nothing to forward
       if (!hasText && !hasAttachments) return;
 
+      // Uploads can take a while; don't send if the bridge was paused meanwhile
+      if (isBridgePaused()) {
+        log.debug("[debug] Bridge paused during attachment upload; dropping message");
+        return;
+      }
+
       // Build message parts and send, tracking for reaction matching
       const trackOutgoing = (sentText, ts) => {
         const hash = generateMeshHash(sentText, ts);
@@ -3064,8 +3171,8 @@ bot.on("messageCreate", async (message) => {
           ? `${name} [D]: ${replyContext}${normalizedContent}`
           : normalizeForMesh(`${name} [D]: ${content}`);
         let wasTruncated = false;
-        if (meshText.length > getMeshMaxLen()) {
-          meshText = meshText.slice(0, getMeshMaxLen() - 1) + "\u2026";
+        if (utf8Len(meshText) > getMeshMaxLen()) {
+          meshText = truncateUtf8(meshText, getMeshMaxLen() - 3) + "\u2026"; // ellipsis is 3 bytes
           wasTruncated = true;
         }
         await enqueueMeshSend(async () => {
@@ -3074,7 +3181,7 @@ bot.on("messageCreate", async (message) => {
           trackOutgoing(meshText, ts);
         });
         if (wasTruncated) {
-          await message.reply(`Message truncated to ${getMeshMaxLen()} chars for mesh.`);
+          await message.reply(`Message truncated to ${getMeshMaxLen()} bytes for mesh.`);
         }
       }
       for (const line of attachmentLines) {
@@ -3094,7 +3201,7 @@ bot.on("messageCreate", async (message) => {
     const command = args.shift()?.toLowerCase();
 
     if (command === 'advert') {
-      await handleAdvert((msg) => message.channel.send(msg));
+      await handleAdvert((msg) => message.channel.send(msg), message.member);
     } else if (command === 'send') {
       // Flood protection gate for prefix send
       if (!(await floodAllowDiscordToMesh(message))) return;
@@ -3121,6 +3228,8 @@ function findSubscribeRoleForEmoji(emojiName) {
   const roleMap = config._SUBSCRIBE_ROLE_MAP || [];
   return roleMap.find(e => e.emoji === emojiName);
 }
+
+const mirroredReactions = new Map(); // "messageId:emoji" -> ms, reactions already sent to mesh
 
 bot.on("messageReactionAdd", async (reaction, user) => {
   try {
@@ -3159,7 +3268,20 @@ bot.on("messageReactionAdd", async (reaction, user) => {
 
     if (isBridgePaused()) return;
 
+    // Each mirrored reaction is a mesh broadcast, so: skip custom Discord emoji (mesh
+    // clients can't show them) and the bot's own messages (votes, notices), send each
+    // emoji at most once per message, and count it against flood protection.
+    if (reaction.emoji.id) return;
+    if (message.author?.id === bot.user.id && !message.webhookId) return;
     const emoji = reaction.emoji.name || "?";
+    const mirrorKey = `${message.id}:${emoji}`;
+    if (mirroredReactions.has(mirrorKey)) return;
+    if (!(await floodAllowDiscordToMesh(message))) return;
+    mirroredReactions.set(mirrorKey, Date.now());
+    if (mirroredReactions.size > 2000) {
+      const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+      for (const [k, t] of mirroredReactions) if (t < cutoff) mirroredReactions.delete(k);
+    }
 
     // Look up the original mesh message by Discord message ID
     const lookup = findHashByDiscordMessageId(message.id);
