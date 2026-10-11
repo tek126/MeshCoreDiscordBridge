@@ -69,7 +69,7 @@ function getChannelScopes() {
   if (scopeCache.config !== config) {
     const { byIdx, warnings } = resolveChannelScopes(config.MESH_CHANNEL_SCOPES, config.DISCORD_TO_MESH_ROUTES);
     for (const w of warnings) log.warn(`Config: ${w}`);
-    if (byIdx.size) log.info(`Flood scopes: ${[...byIdx].map(([i, s]) => `ch${i}${meshChannelNames.has(i) ? ` (${meshChannelNames.get(i)})` : ""}=${s === UNSCOPED ? "unscoped" : "#" + s}`).join(", ")}`);
+    if (byIdx.size) log.info(`Flood scopes: ${[...byIdx].map(([i, s]) => `ch${i}${meshChannelNames.has(i) ? ` (${meshChannelNames.get(i)})` : ""}=${s === UNSCOPED ? "unscoped" : s}`).join(", ")}`);
     scopeCache = { config, byIdx };
   }
   return scopeCache.byIdx;
@@ -86,12 +86,13 @@ function getKnownScopeNames() {
   return [...names];
 }
 
-// "#alb" for a recognised region, "unknown scope" for a scoped packet we can't name,
+// Scopes are shown without a "#" so they aren't mistaken for hashtag channels.
+// "alb" for a recognised region, "unknown scope" for a scoped packet we can't name,
 // null for an unscoped one.
 function describeFrameScope(frame) {
   if (!frame || frame.transportCode === null) return null;
   const name = matchScopeName(frame.transportCode, frame.payloadType, frame.payload, getKnownScopeNames());
-  return name ? `#${name}` : "unknown scope";
+  return name || "unknown scope";
 }
 
 function setRadioScope(payload) {
@@ -152,7 +153,7 @@ async function applyScopeForSend(method, args) {
     return;
   }
   appliedScope = wanted;
-  log.debug(`Flood scope set to ${wanted === UNSCOPED ? "unscoped" : wanted ? "#" + wanted : "radio default"}`);
+  log.debug(`Flood scope set to ${wanted === UNSCOPED ? "unscoped" : wanted || "radio default"}`);
 }
 
 for (const method of ["sendChannelTextMessage", "sendTextMessage", "sendFloodAdvert"]) {
