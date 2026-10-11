@@ -63,12 +63,13 @@ let appliedScope = null;            // null = unknown (fresh start or reconnect)
 let meshFirmwareVer = null;
 let scopeUnsupportedWarned = false;
 let scopeCache = { config: null, byIdx: new Map() };
+const meshChannelNames = new Map(); // mesh channel index -> name on the radio, read at connect
 
 function getChannelScopes() {
   if (scopeCache.config !== config) {
     const { byIdx, warnings } = resolveChannelScopes(config.MESH_CHANNEL_SCOPES, config.DISCORD_TO_MESH_ROUTES);
     for (const w of warnings) log.warn(`Config: ${w}`);
-    if (byIdx.size) log.info(`Flood scopes: ${[...byIdx].map(([i, s]) => `ch${i}=${s === UNSCOPED ? "unscoped" : "#" + s}`).join(", ")}`);
+    if (byIdx.size) log.info(`Flood scopes: ${[...byIdx].map(([i, s]) => `ch${i}${meshChannelNames.has(i) ? ` (${meshChannelNames.get(i)})` : ""}=${s === UNSCOPED ? "unscoped" : "#" + s}`).join(", ")}`);
     scopeCache = { config, byIdx };
   }
   return scopeCache.byIdx;
@@ -1396,10 +1397,25 @@ connection.on("connected", async () => {
     const info = await connection.deviceQuery(Constants.SupportedCompanionProtocolVersion);
     meshFirmwareVer = info?.firmwareVer ?? null;
     scopeUnsupportedWarned = false;
-    log.info(`Radio firmware protocol v${meshFirmwareVer} (${info?.firmware_build_date || "unknown build"}, ${info?.manufacturerModel || "unknown model"})`);
+    const model = String(info?.manufacturerModel || "unknown model").replace(/[\s\0]+/g, " ").trim();
+    log.info(`Radio firmware protocol v${meshFirmwareVer} (${info?.firmware_build_date || "unknown build"}, ${model})`);
   } catch (e) {
     log.warn(`Could not query radio firmware version: ${e?.message ?? e}`);
   }
+  // Radio channel names, so logs (and whoever edits MESH_CHANNEL_SCOPES) can tell slots apart
+  const routedIdxs = Object.keys(config.DISCORD_ROUTES || {}).map(Number).filter(Number.isInteger);
+  for (const idx of routedIdxs) {
+    let timer;
+    try {
+      const ch = await Promise.race([
+        connection.getChannel(idx),
+        new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("timed out")), 3000); }),
+      ]);
+      if (ch?.name) meshChannelNames.set(idx, ch.name);
+    } catch {} finally { clearTimeout(timer); }
+  }
+  if (meshChannelNames.size) log.info(`Mesh channels: ${[...meshChannelNames].map(([i, n]) => `${i}=${n}`).join(", ")}`);
+  scopeCache.config = null; // re-log scopes with channel names
   getChannelScopes(); // log the configured scopes and any config problems
 
   // Seed known nodes so we don't announce existing contacts on restart
