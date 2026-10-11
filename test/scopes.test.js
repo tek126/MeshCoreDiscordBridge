@@ -7,6 +7,8 @@ import {
   scopeKeyForName,
   validateScopeValue,
   resolveChannelScopes,
+  calcTransportCode,
+  matchScopeName,
 } from "../lib/scopes.js";
 
 describe("normalizeScopeName", () => {
@@ -82,5 +84,23 @@ describe("resolveChannelScopes", () => {
     assert.equal(resolveChannelScopes(undefined).byIdx.size, 0);
     assert.equal(resolveChannelScopes([]).byIdx.size, 0);
     assert.equal(resolveChannelScopes("troy").byIdx.size, 0);
+  });
+});
+
+describe("calcTransportCode / matchScopeName", () => {
+  const payload = Buffer.from("0a1b2c3d4e5f60718293a4b5c6d7e8f9", "hex");
+
+  it("matches HMAC-SHA256(key, type || payload), first two bytes little-endian", () => {
+    const key = scopeKeyForName("alb");
+    const mac = crypto.createHmac("sha256", key).update(Buffer.concat([Buffer.of(5), payload])).digest();
+    const expected = mac.readUInt16LE(0);
+    assert.equal(calcTransportCode(key, 5, payload), expected === 0 ? 1 : expected === 0xFFFF ? 0xFFFE : expected);
+  });
+
+  it("finds the region that produced a code, and nothing for other regions", () => {
+    const code = calcTransportCode(scopeKeyForName("alb"), 5, payload);
+    assert.equal(matchScopeName(code, 5, payload, ["troy", "#alb"]), "alb");
+    assert.equal(matchScopeName(code, 5, payload, ["troy"]), null);
+    assert.equal(matchScopeName(code, 4, payload, ["alb"]) === "alb", false); // type is part of the MAC
   });
 });

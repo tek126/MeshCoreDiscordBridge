@@ -18,7 +18,7 @@ import {
   getMessageHistory, isDuplicate, flushHistory, clearHistorySaveTimer, HISTORY_MAX_AGE_MS,
 } from "./lib/reactions.js";
 import { createWebServer } from "./lib/web/server.js";
-import { UNSCOPED, scopeKeyForName, resolveChannelScopes } from "./lib/scopes.js";
+import { UNSCOPED, scopeKeyForName, resolveChannelScopes, normalizeScopeName, validateScopeValue, matchScopeName } from "./lib/scopes.js";
 
 process.on("unhandledRejection", (reason, promise) => {
   log.error("Unhandled promise rejection:", reason);
@@ -73,6 +73,25 @@ function getChannelScopes() {
     scopeCache = { config, byIdx };
   }
   return scopeCache.byIdx;
+}
+
+// Region names to recognise on received packets: every scope we send with, plus
+// MESH_KNOWN_SCOPES for regions other nodes use.
+function getKnownScopeNames() {
+  const names = new Set();
+  for (const s of getChannelScopes().values()) if (s !== UNSCOPED) names.add(s);
+  for (const s of Array.isArray(config.MESH_KNOWN_SCOPES) ? config.MESH_KNOWN_SCOPES : []) {
+    if (s !== UNSCOPED && !validateScopeValue(s)) names.add(normalizeScopeName(s));
+  }
+  return [...names];
+}
+
+// "#alb" for a recognised region, "unknown scope" for a scoped packet we can't name,
+// null for an unscoped one.
+function describeFrameScope(frame) {
+  if (!frame || frame.transportCode === null) return null;
+  const name = matchScopeName(frame.transportCode, frame.payloadType, frame.payload, getKnownScopeNames());
+  return name ? `#${name}` : "unknown scope";
 }
 
 function setRadioScope(payload) {
@@ -1872,9 +1891,14 @@ connection.on(Constants.PushCodes.LogRxData, (data) => {
       prefixes.push(raw.slice(offset, offset + prefixSize));
     }
 
+    const transportCode = pathOffset === 5 ? raw[1] | (raw[2] << 8) : null; // scope's code, little-endian
+    const payload = raw.slice(pathStart + hopCount * prefixSize);
+
     const frame = {
       timestamp: Date.now(),
       payloadType,
+      transportCode,
+      payload,
       hopCount,
       hashMode,
       prefixSize,
@@ -1892,7 +1916,8 @@ connection.on(Constants.PushCodes.LogRxData, (data) => {
     }
 
     const prefixHexes = prefixes.map(p => Buffer.from(p).toString("hex").toUpperCase());
-    log.debug(`RX frame: type=${payloadType} pathByte=0x${pathByte.toString(16)} hashMode=${hashMode} ${hopCount} hops, prefixes=[${prefixHexes.join(", ")}], snr=${data.lastSnr}, rssi=${data.lastRssi}`);
+    const scopeStr = transportCode === null ? "" : ` scope=${describeFrameScope(frame)} (0x${transportCode.toString(16).padStart(4, "0")})`;
+    log.debug(`RX frame: type=${payloadType} pathByte=0x${pathByte.toString(16)} hashMode=${hashMode} ${hopCount} hops, prefixes=[${prefixHexes.join(", ")}],${scopeStr} snr=${data.lastSnr}, rssi=${data.lastRssi}`);
   } catch (e) {
     log.error("RX frame parse error:", e);
   }
@@ -1926,20 +1951,23 @@ function latestRxFrameOfType(payloadType) {
 
 async function buildPathString(channelMessage) {
   const hopCount = channelMessage.pathLen & 0x3F;
+  const direct = channelMessage.pathLen === 0xFF || hopCount === 0;
 
-  if (channelMessage.pathLen === 0xFF || hopCount === 0) {
-    return "-# Direct";
-  }
+  // Scope is read from the raw frame, so match it even for direct messages
+  const frame = channelMessage.pathLen === 0xFF ? null : findMatchingRxFrame(channelMessage);
+  const scope = describeFrameScope(frame);
+  const scopeSuffix = scope ? ` · ${scope}` : "";
 
-  const frame = findMatchingRxFrame(channelMessage);
+  if (direct) return `-# Direct${scopeSuffix}`;
+
   if (!frame || frame.prefixes.length === 0) {
-    return `-# ${hopCount} hop${hopCount !== 1 ? "s" : ""}`;
+    return `-# ${hopCount} hop${hopCount !== 1 ? "s" : ""}${scopeSuffix}`;
   }
 
   const contacts = await getContactsCached();
   const names = frame.prefixes.map(p => resolvePrefix(contacts, p));
 
-  return `-# ${hopCount} hop${hopCount !== 1 ? "s" : ""}: ${names.join(" → ")}`;
+  return `-# ${hopCount} hop${hopCount !== 1 ? "s" : ""}${scopeSuffix}: ${names.join(" → ")}`;
 }
 
 // ---- Mesh DM forwarding ----
