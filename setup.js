@@ -295,6 +295,7 @@ async function main() {
   config.SUBSCRIBE_MESSAGE_ID = existing.SUBSCRIBE_MESSAGE_ID || "";
   config.SUBSCRIBABLE_CHANNELS = existing.SUBSCRIBABLE_CHANNELS || [];
   config.VISIBILITY_SYNC_SKIP_CHANNEL_IDS = existing.VISIBILITY_SYNC_SKIP_CHANNEL_IDS || [];
+  config.MESH_CHANNEL_SCOPES = existing.MESH_CHANNEL_SCOPES || {};
   config.BRIDGE_ADMIN_ROLE_IDS = existing.BRIDGE_ADMIN_ROLE_IDS || [];
   config._SUBSCRIBE_ROLE_MAP = existing._SUBSCRIBE_ROLE_MAP || [];
   config.BLOCKED_MESH_USERS = existing.BLOCKED_MESH_USERS || [];

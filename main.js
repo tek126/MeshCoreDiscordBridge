@@ -18,6 +18,7 @@ import {
   getMessageHistory, isDuplicate, flushHistory, clearHistorySaveTimer, HISTORY_MAX_AGE_MS,
 } from "./lib/reactions.js";
 import { createWebServer } from "./lib/web/server.js";
+import { UNSCOPED, scopeKeyForName, resolveChannelScopes } from "./lib/scopes.js";
 
 process.on("unhandledRejection", (reason, promise) => {
   log.error("Unhandled promise rejection:", reason);
@@ -51,6 +52,89 @@ let lastMeshSendAt = 0;
 // Epoch seconds the library stamped on the most recent channel/DM send. Read it right
 // after awaiting the send; reaction hashes must use this exact second.
 let lastMeshSendTs = 0;
+
+// Per-channel flood scopes (MESH_CHANNEL_SCOPES). The radio keeps one scope override
+// that applies to every later channel message and DM, and it survives a bridge restart,
+// so set it before each send whenever it may differ. Channels without an entry and DMs
+// use the radio's default scope. Adverts always use the radio's default.
+const SCOPE_CMD_TIMEOUT_MS = 5_000;
+const CMD_SET_FLOOD_SCOPE_KEY = 54; // companion firmware v8+; "unscoped" subcommand v12+
+let appliedScope = null;            // null = unknown (fresh start or reconnect)
+let meshFirmwareVer = null;
+let scopeUnsupportedWarned = false;
+let scopeCache = { config: null, byIdx: new Map() };
+
+function getChannelScopes() {
+  if (scopeCache.config !== config) {
+    const { byIdx, warnings } = resolveChannelScopes(config.MESH_CHANNEL_SCOPES, config.DISCORD_TO_MESH_ROUTES);
+    for (const w of warnings) log.warn(`Config: ${w}`);
+    if (byIdx.size) log.info(`Flood scopes: ${[...byIdx].map(([i, s]) => `ch${i}=${s === UNSCOPED ? "unscoped" : "#" + s}`).join(", ")}`);
+    scopeCache = { config, byIdx };
+  }
+  return scopeCache.byIdx;
+}
+
+function setRadioScope(payload) {
+  return new Promise((resolve, reject) => {
+    const cleanup = () => {
+      clearTimeout(timer);
+      connection.off(Constants.ResponseCodes.Ok, onOk);
+      connection.off(Constants.ResponseCodes.Err, onErr);
+    };
+    const onOk = () => { cleanup(); resolve(); };
+    const onErr = () => { cleanup(); reject(new Error("radio rejected the flood scope command")); };
+    const timer = setTimeout(() => { cleanup(); reject(new Error("flood scope command timed out")); }, SCOPE_CMD_TIMEOUT_MS);
+    connection.once(Constants.ResponseCodes.Ok, onOk);
+    connection.once(Constants.ResponseCodes.Err, onErr);
+    connection.sendToRadioFrame(payload).catch((e) => { cleanup(); reject(e); });
+  });
+}
+
+async function applyScopeForSend(method, args) {
+  if (method === "sendFloodAdvert") return;
+  const scopes = getChannelScopes();
+  let wanted = method === "sendChannelTextMessage" ? (scopes.get(Number(args[0])) ?? "") : ""; // "" = radio default
+
+  if (meshFirmwareVer !== null && meshFirmwareVer < 8) {
+    if (scopes.size && !scopeUnsupportedWarned) {
+      log.warn(`Radio firmware v${meshFirmwareVer} has no flood scopes (needs v8+); MESH_CHANNEL_SCOPES is ignored`);
+      scopeUnsupportedWarned = true;
+    }
+    return;
+  }
+  if (wanted === UNSCOPED && meshFirmwareVer !== null && meshFirmwareVer < 12) {
+    if (!scopeUnsupportedWarned) {
+      log.warn(`Radio firmware v${meshFirmwareVer} can't force unscoped sends (needs v12+); "*" channels use the radio's default scope`);
+      scopeUnsupportedWarned = true;
+    }
+    wanted = "";
+  }
+  if (wanted === appliedScope) return;
+
+  let payload;
+  if (wanted === UNSCOPED) payload = Uint8Array.from([CMD_SET_FLOOD_SCOPE_KEY, 1]);
+  else if (wanted) payload = Uint8Array.from([CMD_SET_FLOOD_SCOPE_KEY, 0, ...scopeKeyForName(wanted)]);
+  else payload = Uint8Array.from([CMD_SET_FLOOD_SCOPE_KEY, 0]); // clear override
+  appliedScope = null; // unknown until the radio confirms
+  try {
+    try {
+      await setRadioScope(payload);
+    } catch {
+      // One retry: another command can briefly steal the shared Ok/Err reply
+      await setRadioScope(payload);
+    }
+  } catch (e) {
+    // With no scopes configured this is only clearing a possible leftover override;
+    // don't let firmware without scope support block every send.
+    if (scopes.size) throw e;
+    log.debug(`Could not clear flood scope override: ${e.message}`);
+    appliedScope = "";
+    return;
+  }
+  appliedScope = wanted;
+  log.debug(`Flood scope set to ${wanted === UNSCOPED ? "unscoped" : wanted ? "#" + wanted : "radio default"}`);
+}
+
 for (const method of ["sendChannelTextMessage", "sendTextMessage", "sendFloodAdvert"]) {
   const original = connection[method].bind(connection);
   connection[method] = (...args) => {
@@ -60,6 +144,9 @@ for (const method of ["sendChannelTextMessage", "sendTextMessage", "sendFloodAdv
         log.debug(`Pacing mesh ${method}: waiting ${wait}ms`);
         await sleep(wait);
       }
+      // Sending in the wrong scope could leak a message into another region, so a
+      // scope that can't be set fails the send rather than going out mis-scoped.
+      await applyScopeForSend(method, args);
       let timer;
       try {
         lastMeshSendTs = Math.floor(Date.now() / 1000); // same tick the library stamps the packet
@@ -1304,6 +1391,17 @@ connection.on("connected", async () => {
     log.warn(`Could not read node name from radio; using MESH_NODE_NAME: ${e?.message ?? e}`);
   }
 
+  // Firmware version decides whether flood scopes are available
+  try {
+    const info = await connection.deviceQuery(Constants.SupportedCompanionProtocolVersion);
+    meshFirmwareVer = info?.firmwareVer ?? null;
+    scopeUnsupportedWarned = false;
+    log.info(`Radio firmware protocol v${meshFirmwareVer} (${info?.firmware_build_date || "unknown build"}, ${info?.manufacturerModel || "unknown model"})`);
+  } catch (e) {
+    log.warn(`Could not query radio firmware version: ${e?.message ?? e}`);
+  }
+  getChannelScopes(); // log the configured scopes and any config problems
+
   // Seed known nodes so we don't announce existing contacts on restart
   try {
     const contacts = await connection.getContacts();
@@ -1368,6 +1466,7 @@ async function connectMesh() {
   }
   connection.readBuffer = []; // drop any partial frame from the old port
   contactsInFlight = null;    // a dump on the old port will never finish
+  appliedScope = null;        // the radio may have rebooted and lost its scope override
 
   clearTimeout(connectVerifyTimer);
   connectVerifyTimer = setTimeout(() => {

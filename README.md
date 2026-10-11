@@ -296,6 +296,7 @@ Run `node setup.js` for guided configuration. Below is a reference of all config
 | `MESH_MAXLEN` | Max message length for mesh in characters (default `160`) |
 | `MESH_CHUNK_DELAY_MS` | Delay in ms between chunked message parts (default `2500`) |
 | `MESH_MIN_SEND_GAP_MS` | Minimum gap in ms between any two mesh transmissions, so repeaters aren't handed packets back to back (default `5000`, `0` disables) |
+| `MESH_CHANNEL_SCOPES` | Per-channel flood scope (region) for messages the bridge sends, e.g. `{"2": "troy", "1475203223852814470": "#testing"}`. Keys are mesh channel indexes or routed Discord channel IDs; values are public region names (`#` optional) or `"*"` for unscoped. Channels not listed, and DMs, use the radio's default scope. Only repeaters with that region configured will forward scoped messages. Needs companion firmware v8+ (`"*"` needs v12+); private `$` regions aren't supported |
 
 ### Flood Protection (`FLOOD_PROTECT`)
 
